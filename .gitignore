@@ -1,0 +1,38 @@
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Python
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+
+# py2app build artifacts
+build/
+dist/
+
+# Runtime data (user audio, transcripts, settings)
+recordings/
+latest
+settings.json
+*.log
+
+# macOS
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
+
+# Claude shared infra (user-local symlinks to /Users/orbenozio/Agents)
+.claude/skills
+.claude/commands
+.claude/mds
+
+# Unrelated subprojects
+my-slide/
