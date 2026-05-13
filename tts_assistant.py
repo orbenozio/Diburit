@@ -8,7 +8,7 @@ and `pasted_at` is set, we know the previous user turn was a voice paste
 from Diburit and should be spoken aloud.
 
 Three tiers (per `feedback_sayit_tts_layering` memory):
-  1. SHORT  (cleaned <= 220 chars) -> read whole thing
+  1. SHORT  (cleaned <= 350 chars) -> read whole thing
   2. PUNCHLINE (long w/ short trailing paragraph) -> read just that line
   3. COMPLEX (very long / tables / many code blocks) -> Groq Llama
      summarizes in 1-2 Hebrew sentences, read summary
@@ -32,7 +32,7 @@ from typing import Optional
 import requests
 from dotenv import load_dotenv
 
-__version__ = "1.3.0"
+__version__ = "1.3.1"
 
 
 DIBURIT_HOME = Path.home() / "Diburit"
@@ -73,7 +73,7 @@ GROQ_SUMMARIZER_TIMEOUT_SEC = 15
 GROQ_SUMMARIZER_INPUT_CHAR_LIMIT = 6000
 GROQ_SUMMARIZER_MAX_TOKENS = 220
 
-SHORT_THRESHOLD = 220
+SHORT_THRESHOLD = 350
 LONG_THRESHOLD = 1000
 COMPLEX_CODE_FENCE_COUNT = 4
 PUNCHLINE_MIN_LEN = 10

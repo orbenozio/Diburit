@@ -99,6 +99,16 @@ Bump `__version__` and add an entry below when releasing.
   check into `current_is_remote` so adding the next backend is a
   one-line change.
 
+## [tts_assistant 1.3.1] - 2026-05-13
+
+### Changed
+- **Raised `SHORT_THRESHOLD` from 220 to 350 chars.** Replies up to
+  ~350 cleaned characters are now read aloud in full instead of falling
+  through to the PUNCHLINE path that picks just the last sentence /
+  paragraph. The COMPLEX path (`LONG_THRESHOLD=1000`, tables, ≥4 code
+  fences) is unchanged, and `PUNCHLINE_MAX_LEN=250` stays as-is — it
+  only applies on the > 350-char path now. Docstring updated to match.
+
 ## [tts_assistant 1.2.3] - 2026-05-13
 
 ### Added
