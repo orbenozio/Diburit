@@ -25,7 +25,6 @@ threads.
 
 from __future__ import annotations
 
-import json
 import os
 import queue
 import re
@@ -33,19 +32,15 @@ import subprocess
 import sys
 import threading
 import time
-from dataclasses import dataclass, field
-from datetime import datetime
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
 
 __version__ = "1.6.0"
 
 import numpy as np
-import requests
 import rumps
 import sounddevice as sd
 import soundfile as sf
-from dotenv import load_dotenv
 import objc
 from AppKit import (
     NSApp,
@@ -103,19 +98,46 @@ from Quartz import (
     kCGSessionEventTap,
 )
 
+from diburit_core import (
+    DIBURIT_HOME,
+    DTYPE,
+    EDGE_HEBREW_VOICES,
+    EDGE_PREFIX,
+    FOCUS_SETTLE_SEC,
+    GROQ_PROMPT,
+    GTTS_HEBREW_VOICES,
+    GTTS_PREFIX,
+    HOTKEY_MODE_PTT,
+    HOTKEY_MODE_TOGGLE,
+    MAX_RECORDINGS_PRESETS,
+    MAX_SPEECH_RATE,
+    MIN_SPEECH_RATE,
+    NOTIFICATION_PREVIEW_CHARS,
+    PTT_MIN_HOLD_SEC,
+    QUIT_TRANSCRIBE_GRACE_SEC,
+    RECORDINGS_DIR,
+    SAMPLE_RATE,
+    SETTINGS_FILE,
+    SILENCE_PEAK_THRESHOLD,
+    TRANSCRIPT_PREVIEW_CHARS,
+    VOICE_LIST_TIMEOUT,
+    Utterance,
+    _BASE_SETTINGS,
+    _atomic_write,
+    _audio_is_silent,
+    _is_silence_hallucination,
+    _load_settings,
+    _prune_recordings,
+    _repoint_latest,
+    _save_settings,
+    _transcribe_with_groq,
+)
 
 # ---- paths & constants --------------------------------------------------
 
-DIBURIT_HOME = Path.home() / "Diburit"
-RECORDINGS_DIR = DIBURIT_HOME / "recordings"
 LATEST_DIR_SYMLINK = DIBURIT_HOME / "latest"
-SETTINGS_FILE = DIBURIT_HOME / "settings.json"
 
-load_dotenv(DIBURIT_HOME / ".env")
-
-SAMPLE_RATE = 16_000
 CHANNELS = 1
-DTYPE = "int16"
 
 ICON_IDLE = "🎙"
 ICON_IDLE_PTT = "🎙 ✋"
@@ -123,133 +145,25 @@ ICON_RECORDING = "🎙 🔴"
 ICON_TRANSCRIBING = "🎙 …"
 ICON_OFF = "🎙 ⊘"
 
-GROQ_URL = "https://api.groq.com/openai/v1/audio/transcriptions"
-GROQ_MODEL = "whisper-large-v3"
-GROQ_LANGUAGE = "he"
-GROQ_TIMEOUT = 60
-
-# Whisper accepts an optional `prompt` parameter that biases vocabulary and
-# style. With `language=he` Whisper otherwise tries to transliterate any
-# embedded English ("git commit" → "גיט קומיט"). This hint, in Hebrew,
-# tells the model that the speaker mixes English technical terms into
-# Hebrew speech, listing common ones so the audio gets aligned to them and
-# they're emitted in Latin script. The hint must be in the same language
-# as `language=` per the OpenAI Whisper API contract.
-GROQ_PROMPT = (
-    "זה תמלול של דובר עברית שמשתמש לעיתים במונחים טכניים באנגלית. "
-    "מילים כמו commit, git, terminal, install, function, class, repo, "
-    "branch, pull request, debug, script, file, folder, server, build, "
-    "deploy, log, hook, prompt, token, cache, queue, callback, README — "
-    "השאר אותן באנגלית, לא בתעתיק עברי."
-)
-
-# Tuning knobs. Pulled out of inline literals so behavior is auditable
-# from one place. If you change a number here, search the file for the
-# matching constant name to verify there is no stale duplicate.
-SILENCE_PEAK_THRESHOLD = 200          # int16 peak under this = muted-mic
-FOCUS_SETTLE_SEC = 0.15               # let the post-stop focus shift land
-TRANSCRIBE_RETRY_BACKOFF = (0.5, 1.0) # per-attempt sleep on transient err
-QUIT_TRANSCRIBE_GRACE_SEC = 4.0       # how long Quit waits for in-flight stt
-TRANSCRIPT_PREVIEW_CHARS = 60
-NOTIFICATION_PREVIEW_CHARS = 100
+# Tuning knobs (macOS-only or not yet moved to core).
 PUMP_INTERVAL_SEC = 0.05              # rumps.Timer pump rate
-VOICE_LIST_TIMEOUT = 4
 
-# Whisper-he hallucination phrases for silent / muted input. Normalize
-# (strip + collapse whitespace + drop trailing punctuation) before checking,
-# so "תודה . " and "תודה רבה." both match.
-SILENCE_HALLUCINATIONS = frozenset({
-    "תודה",
-    "תודה רבה",
-    "תודה רבה לכם",
-    "תודה לכם",
-    "שלום",
-    "שלום שלום",
-    "כן",
-    "אוקיי",
-    "בסדר",
-    "להתראות",
-    "thank you",
-    "thanks",
-    "bye",
-    "you",
-    "תרגום אבישי כהן",
-})
-_HALLUCINATION_NORMALIZE = re.compile(r"[\s.,!?\-,\"'״׳]+")
-
-HOTKEY_MODE_TOGGLE = "toggle"
-HOTKEY_MODE_PTT = "ptt"
-_HOTKEY_MODES = frozenset({HOTKEY_MODE_TOGGLE, HOTKEY_MODE_PTT})
-
-# In PTT mode, very short presses are almost certainly accidental key taps
-# (fat-fingered the chord, immediately let go). Drop them before spending a
-# Groq call. The full silence pipeline (`_audio_is_silent`,
-# `_is_silence_hallucination`) is still the safety net for actual silent
-# audio; this is just an early bail for trivially-short PTT holds.
-PTT_MIN_HOLD_SEC = 0.18
-
-DEFAULT_SETTINGS: Dict[str, object] = {
-    "voice": "Carmit",
-    "volume": 0.8,
-    "hotkey": "<cmd>+<shift>+m",
-    "hotkey_mode": HOTKEY_MODE_TOGGLE,
-    "max_recordings_kept": 100,
-    "speech_rate": 1.0,
-    # Whether to show the "Last recording" + "Transcript" rows in the
-    # menu. They're informational only (no callback, no submenu), so users
-    # who don't care about the preview can hide them and shrink the menu.
-    "show_status_rows": True,
-}
+DEFAULT_SETTINGS: Dict[str, object] = {**_BASE_SETTINGS, "voice": "Carmit"}
 
 VOLUME_LEVELS: List[float] = [0.2, 0.4, 0.6, 0.8, 1.0]
-# How many recordings to keep in `~/Diburit/recordings/` before pruning
-# the oldest. Each presets row in the Recordings submenu maps to one of
-# these values, with the active one checkmarked.
-MAX_RECORDINGS_PRESETS: List[int] = [25, 50, 100, 250, 500, 1000]
 # Playback speed multipliers applied via `afplay -r`. `-q 1` is passed
 # alongside so the time-stretch preserves pitch instead of chipmunking
 # the voice. gTTS and Edge are rendered at their natural cadence and
 # only re-timed at playback — the same multiplier therefore covers all
 # three backends uniformly.
 SPEECH_RATE_LEVELS: List[float] = [0.9, 1.0, 1.15, 1.3, 1.5, 1.75]
-MIN_SPEECH_RATE = 0.5
-MAX_SPEECH_RATE = 2.5
 _HEBREW_LOCALE = "he_IL"
 
 # Apps we never want to paste into - includes ourselves, plus Finder which
 # would rename the selected file if it gets a Cmd+V text payload.
 _PASTE_BLOCKLIST = frozenset({"Diburit", "Python", "Finder", ""})
 
-# Microsoft Edge TTS neural voices (free, no API key, network-dependent).
-# Far more natural-sounding than `say -v Carmit`. A `voice` value prefixed
-# with EDGE_PREFIX flips both the in-app preview (`_play_sample`) and the
-# Claude Code Stop hook (`tts_assistant.speak`) onto the edge_tts backend.
-# Keep the prefix in sync with `tts_assistant.EDGE_PREFIX`.
-#
-# Two flavors:
-#   - he-IL-* are Hebrew-locale voices (native Hebrew prosody).
-#   - en-US-*MultilingualNeural are Microsoft's multilingual neural voices
-#     that auto-detect language per sentence. They handle Hebrew + English
-#     code-switching ("פתח את ה-terminal") more naturally than the he-IL
-#     voices, which read embedded English with a heavy accent.
-EDGE_PREFIX = "edge:"
-EDGE_HEBREW_VOICES: List[Tuple[str, str]] = [
-    ("Avri (Edge Neural)", f"{EDGE_PREFIX}he-IL-AvriNeural"),
-    ("Hila (Edge Neural)", f"{EDGE_PREFIX}he-IL-HilaNeural"),
-    ("Ava (Edge Multilingual)", f"{EDGE_PREFIX}en-US-AvaMultilingualNeural"),
-    ("Andrew (Edge Multilingual)", f"{EDGE_PREFIX}en-US-AndrewMultilingualNeural"),
-]
 EDGE_SAMPLE_TIMEOUT_SEC = 15
-
-# Google Translate TTS (`gtts`) - free, no API key, network-dependent.
-# Lower quality than Edge but offers a third voice option. A `voice` value
-# prefixed with GTTS_PREFIX (e.g. "gtts:iw") routes both the preview and
-# the Stop hook to the gTTS backend. Keep the prefix in sync with
-# `tts_assistant.GTTS_PREFIX`.
-GTTS_PREFIX = "gtts:"
-GTTS_HEBREW_VOICES: List[Tuple[str, str]] = [
-    ("Hebrew (gTTS)", f"{GTTS_PREFIX}iw"),
-]
 GTTS_SAMPLE_TIMEOUT_SEC = 15
 
 # Hotkey presets shown in the menubar's Hotkey submenu. Stored values use
@@ -534,65 +448,6 @@ class _QuartzHotkey:
         return event
 
 
-# ---- settings (atomic, validated) ---------------------------------------
-
-def _atomic_write(path: Path, content: str) -> None:
-    """Write `content` to `path` atomically: write to a sibling tempfile,
-    then `os.replace` it onto the target. Eliminates the half-written-file
-    failure mode that bit us when settings.json got corrupted mid-write."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(content, encoding="utf-8")
-    os.replace(tmp, path)
-
-
-def _load_settings() -> Dict[str, object]:
-    """Read settings.json with per-key validation. Unknown / wrong-typed
-    values fall back to their defaults silently - a forward-compat shim
-    so an old settings.json never bricks a newer Diburit."""
-    data: Dict[str, object] = dict(DEFAULT_SETTINGS)
-    if not SETTINGS_FILE.exists():
-        return data
-    try:
-        on_disk = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError) as exc:
-        print(f"[Diburit] settings.json unreadable: {exc}", file=sys.stderr)
-        return data
-    if not isinstance(on_disk, dict):
-        return data
-    if isinstance(on_disk.get("voice"), str) and on_disk["voice"].strip():
-        data["voice"] = on_disk["voice"].strip()
-    try:
-        vol = float(on_disk.get("volume", DEFAULT_SETTINGS["volume"]))  # type: ignore[arg-type]
-        data["volume"] = max(0.0, min(vol, 1.0))
-    except (TypeError, ValueError):
-        pass
-    if isinstance(on_disk.get("hotkey"), str) and on_disk["hotkey"]:
-        data["hotkey"] = on_disk["hotkey"]
-    mode = on_disk.get("hotkey_mode")
-    if isinstance(mode, str) and mode in _HOTKEY_MODES:
-        data["hotkey_mode"] = mode
-    try:
-        n = int(on_disk.get("max_recordings_kept", DEFAULT_SETTINGS["max_recordings_kept"]))  # type: ignore[arg-type]
-        data["max_recordings_kept"] = max(10, min(n, 10_000))
-    except (TypeError, ValueError):
-        pass
-    try:
-        rate = float(on_disk.get("speech_rate", DEFAULT_SETTINGS["speech_rate"]))  # type: ignore[arg-type]
-        data["speech_rate"] = max(MIN_SPEECH_RATE, min(rate, MAX_SPEECH_RATE))
-    except (TypeError, ValueError):
-        pass
-    if isinstance(on_disk.get("show_status_rows"), bool):
-        data["show_status_rows"] = on_disk["show_status_rows"]
-    return data
-
-
-def _save_settings(data: Dict[str, object]) -> None:
-    try:
-        _atomic_write(SETTINGS_FILE, json.dumps(data, indent=2) + "\n")
-    except OSError as exc:
-        print(f"[Diburit] could not write settings.json: {exc}", file=sys.stderr)
-
 
 def _list_hebrew_voices() -> List[Dict[str, str]]:
     # `say -v ?` emits each voice's sample line in the voice's native
@@ -708,132 +563,6 @@ def _paste_into_frontmost() -> Tuple[bool, str]:
     print(f"[Diburit] pasted into {front!r}", flush=True)
     return True, front
 
-
-# ---- transcription ------------------------------------------------------
-
-def _transcribe_with_groq(wav_path: Path) -> str:
-    api_key = os.environ.get("GROQ_API_KEY")
-    if not api_key:
-        raise RuntimeError("GROQ_API_KEY not set (looked in ~/Diburit/.env and env)")
-    last_err: Optional[Exception] = None
-    for attempt in range(len(TRANSCRIBE_RETRY_BACKOFF)):
-        try:
-            with open(wav_path, "rb") as fh:
-                resp = requests.post(
-                    GROQ_URL,
-                    headers={"Authorization": f"Bearer {api_key}"},
-                    files={"file": (wav_path.name, fh, "audio/wav")},
-                    data={
-                        "model": GROQ_MODEL,
-                        "language": GROQ_LANGUAGE,
-                        "response_format": "text",
-                        "prompt": GROQ_PROMPT,
-                    },
-                    timeout=GROQ_TIMEOUT,
-                )
-        except Exception as exc:
-            last_err = exc
-            time.sleep(TRANSCRIBE_RETRY_BACKOFF[attempt])
-            continue
-        if resp.status_code in (429, 500, 502, 503, 504) and attempt + 1 < len(TRANSCRIBE_RETRY_BACKOFF):
-            last_err = RuntimeError(f"HTTP {resp.status_code}: {resp.text[:300]}")
-            time.sleep(TRANSCRIBE_RETRY_BACKOFF[attempt])
-            continue
-        if resp.status_code != 200:
-            raise RuntimeError(f"HTTP {resp.status_code}: {resp.text[:300]}")
-        return resp.text.strip()
-    raise last_err or RuntimeError("transcription failed without specific error")
-
-
-def _is_silence_hallucination(text: str) -> bool:
-    normalized = _HALLUCINATION_NORMALIZE.sub(" ", text.lower()).strip()
-    return normalized in SILENCE_HALLUCINATIONS or normalized == ""
-
-
-# ---- audio rms check (cheap muted-mic detector) -------------------------
-
-def _audio_is_silent(data: np.ndarray, threshold: int = SILENCE_PEAK_THRESHOLD) -> bool:
-    """True iff the int16 audio buffer has near-zero peak amplitude. Cheap
-    second line of defense against the muted-mic case, complementary to
-    `_is_silence_hallucination`."""
-    if data.size == 0:
-        return True
-    return int(np.max(np.abs(data))) < threshold
-
-
-# ---- recordings dir + per-utterance metadata ----------------------------
-
-@dataclass
-class Utterance:
-    """Everything a single dictation produces, on disk."""
-
-    timestamp: str
-    dir: Path
-    audio_path: Path
-    transcript_path: Path
-    metadata_path: Path
-    target_app: Optional[str] = None
-    transcript: Optional[str] = None
-    pasted_at: Optional[float] = None
-    extra: Dict[str, object] = field(default_factory=dict)
-
-    @classmethod
-    def fresh(cls) -> "Utterance":
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        # Add a microsecond suffix to disambiguate two-recordings-in-one-second.
-        ts = f"{ts}_{datetime.now().microsecond:06d}"
-        directory = RECORDINGS_DIR / f"diburit_{ts}"
-        directory.mkdir(parents=True, exist_ok=True)
-        return cls(
-            timestamp=ts,
-            dir=directory,
-            audio_path=directory / "audio.wav",
-            transcript_path=directory / "transcript.txt",
-            metadata_path=directory / "metadata.json",
-        )
-
-    def write_metadata(self) -> None:
-        payload = {
-            "schema_version": 1,
-            "timestamp": self.timestamp,
-            "transcript": self.transcript,
-            "target_app": self.target_app,
-            "pasted_at": self.pasted_at,
-            "audio_path": str(self.audio_path),
-            **self.extra,
-        }
-        _atomic_write(self.metadata_path, json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
-
-
-def _repoint_latest_symlink(target_dir: Path) -> None:
-    """Atomically point ~/Diburit/latest -> target_dir. Uses a temp symlink
-    + os.replace so a crash mid-write can't leave a dangling state."""
-    tmp = LATEST_DIR_SYMLINK.with_name(LATEST_DIR_SYMLINK.name + ".tmp")
-    if tmp.is_symlink() or tmp.exists():
-        tmp.unlink()
-    tmp.symlink_to(target_dir)
-    os.replace(tmp, LATEST_DIR_SYMLINK)
-
-
-def _prune_recordings(keep_n: int) -> None:
-    """Keep the newest `keep_n` recording dirs, delete the rest. Best-effort."""
-    if keep_n <= 0:
-        return
-    try:
-        dirs = sorted(
-            [p for p in RECORDINGS_DIR.iterdir() if p.is_dir() and p.name.startswith("diburit_")],
-            key=lambda p: p.name,
-            reverse=True,
-        )
-    except FileNotFoundError:
-        return
-    for old in dirs[keep_n:]:
-        try:
-            for child in old.iterdir():
-                child.unlink(missing_ok=True)
-            old.rmdir()
-        except Exception as exc:
-            print(f"[Diburit] could not prune {old}: {exc}", file=sys.stderr)
 
 
 # ---- sample playback ----------------------------------------------------
@@ -1302,7 +1031,7 @@ class DiburitApp(rumps.App):
     def __init__(self) -> None:
         super().__init__(ICON_IDLE, quit_button=None)
 
-        settings = _load_settings()
+        settings = _load_settings(defaults=DEFAULT_SETTINGS)
         self.voice: str = str(settings.get("voice", DEFAULT_SETTINGS["voice"]))
         self.volume: float = float(settings.get("volume", DEFAULT_SETTINGS["volume"]))  # type: ignore[arg-type]
         self.hotkey: str = str(settings.get("hotkey", DEFAULT_SETTINGS["hotkey"]))
@@ -1772,7 +1501,7 @@ class DiburitApp(rumps.App):
 
         try:
             utterance.write_metadata()
-            _repoint_latest_symlink(utterance.dir)
+            _repoint_latest(utterance.dir)
         except OSError as exc:
             print(f"[Diburit] could not finalize utterance metadata: {exc}", file=sys.stderr)
 
