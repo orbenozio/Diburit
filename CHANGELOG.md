@@ -3,9 +3,78 @@
 All notable changes to Diburit (דיבורית).
 Versions follow [Semantic Versioning](https://semver.org/).
 
-The runtime version lives in `diburit.py::__version__`; `setup.py` reads
-it at build time and writes it into `CFBundleVersion` / `CFBundleShortVersionString`.
-Bump `__version__` and add an entry below when releasing.
+The runtime version lives in `diburit.py::__version__` (macOS) and
+`diburit_win.py::__version__` (Windows) — they move independently. On
+macOS, `setup.py` reads `diburit.py::__version__` at build time and writes
+it into `CFBundleVersion` / `CFBundleShortVersionString`. Bump the
+relevant `__version__` and add an entry below when releasing.
+
+## [win 1.7.0] - 2026-05-16
+
+First Windows release of Diburit. Brings full feature parity with the
+macOS app (`Cmd+Shift+M` → `Ctrl+Shift+M`, menu-bar → system-tray) and
+adds polish needed for daily use on Windows.
+
+### Added
+- **Windows port (`diburit_win.py`).** System-tray app using `pystray`
+  (state-coloured icon: violet idle / crimson recording / orange
+  transcribing / grey disabled), `tkinter` preferences window, `pynput`
+  global hotkey listener. Same recording → transcription → paste
+  pipeline as macOS, same `~/Diburit/` runtime layout, same `settings.json`
+  schema. Toggle / push-to-talk modes both supported.
+- **Platform shim (`platform_compat.py`).** Single module that abstracts
+  the ten platform-specific operations (clipboard, paste, frontmost-app,
+  notify, audio playback, open-folder, frontmost lookup, …) behind one
+  API. Every platform-specific import (`Quartz`, `win32gui`, `pyperclip`)
+  is local to its function so importing the module never crashes on the
+  wrong OS.
+- **Shared core (`diburit_core.py`).** Extracted from `diburit.py`:
+  `Utterance`, settings load/save with `_atomic_write`, Groq
+  transcription, silence detection, hallucination filter, recordings
+  pruning, `latest` symlink repoint. Imported by both `diburit.py` and
+  `diburit_win.py`.
+- **Windows install path.** `requirements_win.txt` and `install_win.bat`
+  for a one-shot venv setup. `pythonw diburit_win.py` runs without a
+  console window (for autostart); `python diburit_win.py` shows logs
+  live (for development). Either way logs persist to
+  `~/Diburit/runtime.log`.
+- **Edge TTS / gTTS / pyttsx3 voice options** for the prefs window, with
+  the prefs UI letting the user preview each Hebrew voice before
+  committing.
+- **`tests/test_hotkey_win.py`** — Windows-only unit tests for the
+  hotkey chord parser; auto-skip on macOS via `@unittest.skipUnless`.
+
+### Fixed
+- **Silent normal flow.** Removed the three status notifications
+  ("Recording…", "Recorded Xs, transcribing…", and the final transcript
+  preview) that fired on every successful utterance. Windows toasts in
+  that volume stole focus from the user's target window mid-flow. The
+  tray-icon colour already communicates the same state. Notifications
+  are now reserved for *error* states (mic denied, silent recording,
+  transcription failed, paste skipped onto a blocked target).
+- **Paste fails silently under non-Latin keyboard layouts.**
+  `pyautogui.hotkey("ctrl", "v")` routes "v" through the active
+  keyboard layout — under a Hebrew layout the resulting WM_KEYDOWN
+  isn't interpreted as paste by the receiving app, even though pyautogui
+  raises no error and the log records "pasted into X". Replaced with a
+  direct `SendInput` call (`platform_compat._win_send_ctrl_v`) using
+  explicit `VK_CONTROL=0x11` + `VK_V=0x56`, atomic and layout-independent.
+  pyautogui kept only as a fallback when `SendInput` itself raises.
+- **Hotkey leaks into the foreground app.** A bare `pynput.keyboard.Listener`
+  passes the hotkey through to whatever window has focus, so F12 fires
+  VS Code's "Go to Definition" (and other chords leak similarly), pulling
+  focus to the editor *before* the `Ctrl+V` arrives. Added
+  `_make_event_filter` wired into `Listener(win32_event_filter=...)`:
+  modifier groups (`Ctrl`/`Shift`/`Alt`) still pass through normally,
+  but the leaf key is suppressed via `listener.suppress_event()` once
+  the chord's modifier requirements are satisfied — so other Ctrl/Shift
+  shortcuts work everywhere except the exact registered chord.
+- **`_PASTE_BLOCKLIST` blocking too much.** Identifying Diburit-itself
+  by process name (`"python"` / `"pythonw"`) also blocked pasting into
+  any other Python window — REPLs, unrelated scripts, etc. Now
+  `platform_compat.get_frontmost_app` compares the foreground HWND's PID
+  to `os.getpid()` and returns the literal `"Diburit"` on a self-match;
+  the blocklist contains only `Diburit` + terminal apps + empty string.
 
 ## [1.6.0] - 2026-05-13
 

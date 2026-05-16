@@ -28,6 +28,14 @@ settings.json
 # IDE
 .vscode/
 .idea/
+.vs/
+
+# Claude per-user local overrides (kept out of git, like .vscode/settings.json)
+.claude/settings.local.json
+
+# Local stderr/stdout snapshots from `pythonw` runs
+diburit_err.txt
+diburit_out.txt
 
 # Claude shared infra (user-local symlinks to /Users/orbenozio/Agents)
 .claude/skills

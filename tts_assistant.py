@@ -19,12 +19,12 @@ once we have spoken, so the next typed user message does not trigger TTS.
 
 from __future__ import annotations
 
-import fcntl
 import json
 import os
 import re
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 from typing import Optional
@@ -39,8 +39,9 @@ DIBURIT_HOME = Path.home() / "Diburit"
 LATEST_DIR = DIBURIT_HOME / "latest"
 SETTINGS_FILE = DIBURIT_HOME / "settings.json"
 METADATA_NAME = "metadata.json"
-SPEECH_AIFF = Path("/tmp/diburit_tts.aiff")
-SPEECH_MP3 = Path("/tmp/diburit_tts.mp3")
+_TMP = Path(tempfile.gettempdir())
+SPEECH_AIFF = _TMP / "diburit_tts.aiff"
+SPEECH_MP3  = _TMP / "diburit_tts.mp3"
 METADATA_MAX_AGE_SECONDS = 600
 
 DEFAULT_VOICE = "Carmit"
@@ -157,45 +158,46 @@ def _dbg_log(payload: dict) -> None:
         pass
 
 
-def read_and_consume_metadata(latest_user_text: Optional[str]) -> Optional[dict]:
-    """Read ~/Diburit/latest/metadata.json. If pasted_at is set and fresh,
-    AND the Diburit transcript appears inside this session's latest user
-    message, mark consumed and return the parsed payload. Otherwise return
-    None and leave metadata as-is so the actual paste-target session can
-    pick it up on its next Stop fire. The transcript-in-user-text check
-    is what distinguishes the paste-target session from every other
-    Claude Code window whose Stop hook also sees the same global metadata
-    file — timestamp proximity alone is too loose (you can switch projects
-    in seconds and type something there that's still within tolerance).
-    Using `consumed` instead of `unlink` so the recordings/.../metadata.json
-    file stays as a permanent history alongside its audio+transcript.
-
-    The whole read-check-write is done while holding an exclusive `flock` on
-    a sibling lockfile so two Stop-hook instances that fire back-to-back
-    (e.g. user spams Enter on a long answer) cannot both observe the same
-    pre-consumed metadata and double-speak."""
-    if not LATEST_DIR.exists():
+def _resolve_latest_dir() -> Optional[Path]:
+    """Return the Path of the most-recent recording directory.
+    macOS: follows the `latest` symlink in DIBURIT_HOME.
+    Windows: reads `latest.txt` which contains the path as plain text.
+    Falls back gracefully if neither exists."""
+    if sys.platform == "darwin":
+        if LATEST_DIR.exists():
+            return LATEST_DIR
         return None
-    metadata_path = LATEST_DIR / METADATA_NAME
+    # Windows: try symlink first (works when Developer Mode is enabled),
+    # then fall back to latest.txt written by diburit_win.py.
+    if LATEST_DIR.exists():
+        return LATEST_DIR
+    latest_txt = DIBURIT_HOME / "latest.txt"
+    if latest_txt.exists():
+        try:
+            p = Path(latest_txt.read_text(encoding="utf-8").strip())
+            return p if p.is_dir() else None
+        except OSError:
+            return None
+    return None
+
+
+def read_and_consume_metadata(latest_user_text: Optional[str]) -> Optional[dict]:
+    """Read the latest recording's metadata.json.
+
+    If pasted_at is set and fresh, AND the transcript appears in the current
+    session's latest user message, marks consumed and returns the payload.
+    Uses _resolve_latest_dir() so it works on both macOS (symlink) and
+    Windows (latest.txt fallback). Locking is platform-conditional:
+    macOS uses fcntl.flock; Windows uses filelock.FileLock."""
+    recording_dir = _resolve_latest_dir()
+    if recording_dir is None:
+        return None
+    metadata_path = recording_dir / METADATA_NAME
     if not metadata_path.exists():
         return None
-
-    # Lockfile lives next to the metadata so it follows the symlink target
-    # and is naturally scoped per-utterance.
     lock_path = metadata_path.with_suffix(".json.lock")
-    try:
-        lock_fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o600)
-    except OSError as exc:
-        print(f"[tts] could not open lockfile: {exc}", file=sys.stderr)
-        return None
 
-    try:
-        try:
-            fcntl.flock(lock_fd, fcntl.LOCK_EX)
-        except OSError as exc:
-            print(f"[tts] could not acquire lock: {exc}", file=sys.stderr)
-            return None
-
+    def _do_read_write() -> Optional[dict]:
         try:
             data = json.loads(metadata_path.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, OSError):
@@ -218,22 +220,61 @@ def read_and_consume_metadata(latest_user_text: Optional[str]) -> Optional[dict]
         data["consumed"] = True
         try:
             tmp = metadata_path.with_suffix(".json.tmp")
-            tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+            tmp.write_text(
+                json.dumps(data, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
             os.replace(tmp, metadata_path)
         except OSError as exc:
             print(f"[tts] could not mark metadata consumed: {exc}", file=sys.stderr)
         return data
-    finally:
+
+    if sys.platform == "darwin":
+        import fcntl  # noqa: PLC0415
         try:
-            fcntl.flock(lock_fd, fcntl.LOCK_UN)
-        except OSError:
-            pass
-        os.close(lock_fd)
+            lock_fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o600)
+        except OSError as exc:
+            print(f"[tts] could not open lockfile: {exc}", file=sys.stderr)
+            return None
+        try:
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            except OSError as exc:
+                print(f"[tts] could not acquire lock: {exc}", file=sys.stderr)
+                return None
+            return _do_read_write()
+        finally:
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+            os.close(lock_fd)
+    else:
+        try:
+            from filelock import FileLock  # type: ignore  # noqa: PLC0415
+            with FileLock(str(lock_path), timeout=5):
+                return _do_read_write()
+        except Exception as exc:
+            print(f"[tts] file lock failed: {exc}", file=sys.stderr)
+            return None
 
 
 def find_session_jsonl(session_id: str) -> Optional[Path]:
-    matches = list((Path.home() / ".claude" / "projects").glob(f"*/{session_id}.jsonl"))
-    return matches[0] if matches else None
+    """Locate the Claude Code session JSONL file by session_id.
+    macOS: ~/.claude/projects/<proj>/<session_id>.jsonl
+    Windows: %APPDATA%\Claude\projects\<proj>/<session_id>.jsonl"""
+    search_roots = [Path.home() / ".claude" / "projects"]
+    if sys.platform != "darwin":
+        appdata = os.environ.get("APPDATA")
+        if appdata:
+            search_roots.append(Path(appdata) / "Claude" / "projects")
+    for root in search_roots:
+        if not root.exists():
+            continue
+        matches = list(root.glob(f"*/{session_id}.jsonl"))
+        if matches:
+            return matches[0]
+    return None
 
 
 def latest_user_and_assistant(jsonl: Path) -> tuple:
@@ -463,72 +504,106 @@ def _render_gtts(text: str, gtts_lang: str, out_path: Path) -> bool:
     return ok
 
 
-def _afplay(path: Path, volume: float, rate: float = 1.0) -> None:
-    # `-q 1` enables the high-quality time-stretch algorithm so that
-    # rate != 1.0 preserves pitch instead of chipmunking the voice.
-    r = max(MIN_SPEECH_RATE, min(rate, MAX_SPEECH_RATE))
-    try:
-        subprocess.Popen(
-            ["afplay", "-v", f"{volume:.2f}", "-r", f"{r:.2f}", "-q", "1", str(path)],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            start_new_session=True,
-        )
-    except Exception as exc:
-        print(f"[tts] afplay failed: {exc}", file=sys.stderr)
+def _afplay_nonblocking(path: Path, volume: float, rate: float = 1.0) -> None:
+    """Fire-and-forget audio playback. Returns immediately."""
+    vol = max(0.0, min(volume, 1.0))
+    if sys.platform == "darwin":
+        r = max(MIN_SPEECH_RATE, min(rate, MAX_SPEECH_RATE))
+        try:
+            subprocess.Popen(
+                ["afplay", "-v", f"{vol:.2f}", "-r", f"{r:.2f}", "-q", "1", str(path)],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+        except Exception as exc:
+            print(f"[tts] afplay failed: {exc}", file=sys.stderr)
+    else:
+        import threading  # noqa: PLC0415
+
+        def _play() -> None:
+            try:
+                import pygame  # type: ignore  # noqa: PLC0415
+                pygame.mixer.init()
+                pygame.mixer.music.load(str(path))
+                pygame.mixer.music.set_volume(vol)
+                pygame.mixer.music.play()
+                while pygame.mixer.music.get_busy():
+                    time.sleep(0.05)
+            except Exception as exc:
+                print(f"[tts] pygame play failed: {exc}", file=sys.stderr)
+
+        threading.Thread(target=_play, daemon=True).start()
 
 
 def _render_say(text: str, voice: str, env: dict) -> bool:
-    try:
-        subprocess.run(
-            ["say", "-v", voice, "-o", str(SPEECH_AIFF), text],
-            check=False, timeout=SAY_RENDER_TIMEOUT_SEC,
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            env=env,
-        )
-    except Exception as exc:
-        print(f"[tts] say render failed: {exc}", file=sys.stderr)
-        return False
-    return SPEECH_AIFF.exists() and SPEECH_AIFF.stat().st_size > 0
+    """Render speech to an audio file. macOS: `say`; Windows: pyttsx3 SAPI5."""
+    if sys.platform == "darwin":
+        try:
+            subprocess.run(
+                ["say", "-v", voice, "-o", str(SPEECH_AIFF), text],
+                check=False, timeout=SAY_RENDER_TIMEOUT_SEC,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                env=env,
+            )
+        except Exception as exc:
+            print(f"[tts] say render failed: {exc}", file=sys.stderr)
+            return False
+        return SPEECH_AIFF.exists() and SPEECH_AIFF.stat().st_size > 0
+    else:
+        # Windows: use SAPI5 via pyttsx3. Requires an installed Hebrew voice
+        # pack — on clean Windows this will fail silently (no Hebrew SAPI5 voice).
+        # Primary backend is edge-tts; this is only called as a last-resort fallback.
+        try:
+            import pyttsx3  # type: ignore  # noqa: PLC0415
+            engine = pyttsx3.init()
+            for v in engine.getProperty("voices") or []:
+                if voice.lower() in (v.name or "").lower():
+                    engine.setProperty("voice", v.id)
+                    break
+            engine.save_to_file(text, str(SPEECH_MP3))
+            engine.runAndWait()
+            return SPEECH_MP3.exists() and SPEECH_MP3.stat().st_size > 0
+        except Exception as exc:
+            print(f"[tts] pyttsx3 render failed: {exc}", file=sys.stderr)
+            return False
 
 
 def speak(text: str) -> None:
     if not text.strip():
         return
     voice, volume, rate = load_voice_settings()
-    # `say` reads the text argv positionally as bytes. When the hook is
-    # launched by Claude Code under launchd's stripped env (no LANG /
-    # LC_CTYPE), the runtime treats argv as MacRoman, which mangles
-    # Hebrew. Force a UTF-8 locale in the child env to be safe.
     env = os.environ.copy()
     env.setdefault("LC_CTYPE", "en_US.UTF-8")
     env.setdefault("LANG", "en_US.UTF-8")
 
+    # On macOS the say-fallback voice is Carmit (always available).
+    # On Windows there is no guaranteed local TTS — pyttsx3 only works if the
+    # user has installed a Hebrew voice pack. Failing gracefully (silent) is
+    # better than crashing with a subprocess error.
+    _say_out = SPEECH_AIFF if sys.platform == "darwin" else SPEECH_MP3
+
     if voice.startswith(EDGE_PREFIX):
         edge_voice = voice[len(EDGE_PREFIX):]
         if _render_edge_tts(text, edge_voice, SPEECH_MP3):
-            _afplay(SPEECH_MP3, volume, rate)
+            _afplay_nonblocking(SPEECH_MP3, volume, rate)
             return
-        # Edge failed (offline, package missing, voice typo) - fall back
-        # to Carmit so the user still hears the response.
         print(f"[tts] edge tts failed, falling back to {DEFAULT_VOICE}", file=sys.stderr)
         if _render_say(text, DEFAULT_VOICE, env):
-            _afplay(SPEECH_AIFF, volume, rate)
+            _afplay_nonblocking(_say_out, volume, rate)
         return
 
     if voice.startswith(GTTS_PREFIX):
         gtts_lang = voice[len(GTTS_PREFIX):]
         if _render_gtts(text, gtts_lang, SPEECH_MP3):
-            _afplay(SPEECH_MP3, volume, rate)
+            _afplay_nonblocking(SPEECH_MP3, volume, rate)
             return
-        # gTTS failed (offline, package missing, rate limit) - fall back
-        # to Carmit so the user still hears the response.
         print(f"[tts] gtts failed, falling back to {DEFAULT_VOICE}", file=sys.stderr)
         if _render_say(text, DEFAULT_VOICE, env):
-            _afplay(SPEECH_AIFF, volume, rate)
+            _afplay_nonblocking(_say_out, volume, rate)
         return
 
     if _render_say(text, voice, env):
-        _afplay(SPEECH_AIFF, volume, rate)
+        _afplay_nonblocking(_say_out, volume, rate)
 
 
 def choose_what_to_speak(raw: str) -> str:

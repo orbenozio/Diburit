@@ -1,0 +1,42 @@
+# Diburit — Windows dependencies
+# Install with: pip install -r requirements_win.txt
+
+# ── Core (same as macOS) ─────────────────────────────────────────────────────
+numpy
+requests
+sounddevice
+soundfile
+python-dotenv
+edge-tts
+gtts
+
+# ── Windows UI / system tray ─────────────────────────────────────────────────
+pystray>=0.19.5
+Pillow>=10.0.0          # pystray needs PIL for tray icons
+
+# ── Hotkeys ──────────────────────────────────────────────────────────────────
+pynput>=1.7.6
+
+# ── Clipboard + paste ────────────────────────────────────────────────────────
+pyperclip>=1.8.2
+pyautogui>=0.9.54
+
+# ── Foreground window detection ───────────────────────────────────────────────
+pywin32>=306
+psutil>=5.9.0
+
+# ── Notifications (Windows Runtime Toast — works on Win 10/11) ────────────────
+winotify>=1.1.0
+
+# ── Audio playback (MP3 / WAV) ───────────────────────────────────────────────
+pygame>=2.5.0
+
+# ── Local TTS fallback (SAPI5, Hebrew only if voice pack installed) ────────────
+pyttsx3>=2.90
+
+# ── Cross-platform file locking (replaces fcntl) ─────────────────────────────
+filelock>=3.13.0
+
+# Note: tkinter is stdlib — no pip entry needed.
+# If missing (Windows Store Python), reinstall Python from python.org
+# and check "tcl/tk and IDLE" in the optional features.
