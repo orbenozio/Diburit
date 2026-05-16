@@ -56,10 +56,19 @@
 | shareInviteMessage | LongText | הודעת שיתוף ברירת מחדל ל-WhatsApp. משתנה: `{{siteUrl}}` |
 | rsvpOpen | Boolean | האם RSVP פתוח לשליחה חדשה (ברירת מחדל: true) |
 | ogDescription | LongText | תיאור לתגי OG / WhatsApp preview (160 תווים מקסימום) |
-| adminEmail | Email | כתובת אימייל האדמין |
-| adminPasswordHash | Text | סיסמת האדמין — מאוחסנת כ-bcrypt hash (מייוצר בצד השרת) |
-| adminSessionToken | Text | טוקן session פעיל (UUID, מאופס בהתנתקות) |
 | updatedAt | DateTime | עדכון אחרון |
+
+---
+
+### AdminUser
+
+רשימת אימיילים מורשים לגישת אדמין.
+
+| שדה | סוג | תיאור |
+|-----|-----|--------|
+| email | Email | אימייל של משתמש מורשה |
+
+> **הערה:** מנגנון ה-login עצמו מנוהל על ידי Base44 (כניסה עם אימייל / Google). הבדיקה בצד האפליקציה היא פשוט: האם `currentUser.email` קיים בטבלת `AdminUser`? אם כן — אדמין. אם לא — מסך "אין גישה".
 
 ---
 
@@ -81,7 +90,6 @@
 | createdAt | DateTime | תאריך יצירה |
 | updatedAt | DateTime | עדכון אחרון |
 
-> **הערה:** מודל `AdminUser` הוסר. אימות האדמין מנוהל דרך `adminEmail` + `adminPasswordHash` + `adminSessionToken` ב-EventSettings.
 
 ---
 
@@ -95,7 +103,7 @@
 | `/rsvp/thank-you?code=UUID` | עמוד תודה | ציבורי |
 | `/info` | מידע הגעה ומפה | ציבורי |
 | `/qr` | QR Code להדפסה | ציבורי |
-| `/admin` | כניסת אדמין | ציבורי (redirect לדשבורד אם מחובר) |
+| `/admin` | דשבורד / בדיקת הרשאות | דורש login של Base44 |
 | `/admin/dashboard` | דשבורד אדמין | אדמין בלבד |
 | `/admin/guests` | ניהול אורחים | אדמין בלבד |
 | `/admin/settings` | עריכת תוכן האתר | אדמין בלבד |
@@ -250,26 +258,24 @@
 
 ---
 
-## עמוד Admin Login (`/admin`)
+## גישת אדמין
 
-**שדות:** email (LTR) + password
+מנגנון ה-login מנוהל לחלוטין על ידי Base44 (כניסה עם Google / אימייל — מובנה בפלטפורמה).
 
-**לוגיקת כניסה:**
-1. השרת משווה email ל-`EventSettings.adminEmail` וסיסמה ל-`adminPasswordHash` (bcrypt.compare)
-2. **תקין** → `adminSessionToken` = UUID v4 חדש נשמר ב-EventSettings + מוחזר ל-client → נשמר ב-`localStorage.adminToken` → redirect ל-`/admin/dashboard`
-3. **לא תקין** → "פרטי הכניסה שגויים" (לא לפרט איזה שדה)
-4. לאחר 5 ניסיונות כושלים — נעילה ל-15 דקות עם countdown
-5. אם כבר מחובר (token תקין ב-localStorage) → redirect מיידי לדשבורד
+### הגדרת אדמין
+
+מוסיפים רשומה ל-`AdminUser` עם האימייל הרצוי. זהו.
 
 ### הגנת עמודי Admin
 
-כל `/admin/*` (מלבד `/admin`):
-- קריאת `adminToken` מ-localStorage
-- אם אין → redirect ל-`/admin`
-- כל בקשת API: `Authorization: Bearer {adminToken}`
-- אם 401 → נקה localStorage + redirect ל-`/admin` + toast "פג תוקף החיבור, אנא התחברו מחדש"
+בכל עמוד `/admin/*` מבצעים בדיקה בטעינה:
 
-**כפתור התנתקות:** נקה token ב-localStorage + אפס `adminSessionToken` ב-EventSettings + redirect ל-`/admin`
+```javascript
+const isAdmin = await AdminUser.filter({ email: currentUser?.email }).first();
+if (!isAdmin) → redirect ל-"/" עם הודעה "אין גישה"
+```
+
+**זהו — אין צורך ב-token, bcrypt, session, או מסך login מותאם. Base44 מטפל בהכל.**
 
 ---
 
@@ -358,7 +364,7 @@ Skeleton rows — שורות placeholder אפורות מונפשות בזמן ט
 
 ## עריכת תוכן (`/admin/settings`)
 
-שישה טאבים:
+חמישה טאבים:
 
 **1. פרטי האירוע**
 eventDate (date picker), startTime/endTime (time picker), venueName, address, venueDescription, googleMapsUrl, wazeUrl, mapEmbedUrl, parkingTitle, parkingInstructions
@@ -377,14 +383,9 @@ thankYouMessage, rsvpClosedMessage, shareInviteMessage, reminderTemplateNoRespon
 **5. RSVP והגדרות**
 rsvpButtonText, rsvpFormTitle, rsvpFormIntroText, rsvpOpen (מתג), contactName, contactPhone
 
-**6. חשבון אדמין**
-- שינוי אימייל: שדה email חדש
-- שינוי סיסמה: "סיסמה נוכחית" + "סיסמה חדשה" + "אימות סיסמה"
-- שמירה → bcrypt hash לפני אחסון
-
 **כל טאב:** כפתור "שמור" + toast "נשמר בהצלחה!" / "שגיאה בשמירה, נסה שוב"
 
-> **אזהרה:** אם `adminPasswordHash` תואם את ה-hash של ברירת המחדל "admin123" — הצג banner: "סיסמת ברירת המחדל עדיין בשימוש — אנא שנה אותה עכשיו"
+> **ניהול אדמינים** מתבצע ישירות בממשק Base44 (הוספה/הסרה של אימיילים מטבלת AdminUser) — לא צריך UI לזה באפליקציה עצמה.
 
 ---
 
@@ -470,8 +471,6 @@ rsvpButtonText, rsvpFormTitle, rsvpFormIntroText, rsvpOpen (מתג), contactName
   "mainTitle": "ברוכים הבאים לזבד הבת של",
   "rsvpButtonText": "אישור הגעה",
   "rsvpOpen": true,
-  "adminEmail": "admin@alicerose.co.il",
-  "adminPasswordHash": "<bcrypt hash of 'admin123'>",
   "reminderTemplateNoResponse": "שלום {{name}}, רצינו לוודא שקיבלתם את ההזמנה לזבד הבת של אליס רוז. נשמח לדעת אם תוכלו להגיע ב-{{eventDate}}. לאישור הגעה: {{editLink}}",
   "reminderTemplateMaybe": "שלום {{name}}, ראינו שענית 'אולי' להזמנה שלנו. עדכנו אותנו אם תוכלו להגיע ב-{{eventDate}}: {{editLink}}",
   "reminderTemplateDayBefore": "שלום {{name}}, תזכורת ידידותית — מחכים לכם מחר ב-{{time}} ב-{{address}}! מחכים בקוצר רוח 💕",
@@ -571,10 +570,14 @@ Fields:
 - shareInviteMessage (LongText, placeholder: {{siteUrl}})
 - rsvpOpen (Boolean, default: true)
 - ogDescription (LongText, max 160 chars)
-- adminEmail (Email)
-- adminPasswordHash (Text — store bcrypt hash, NEVER plaintext)
-- adminSessionToken (Text — UUID v4, regenerated on each login, cleared on logout)
 - updatedAt (DateTime)
+
+### AdminUser
+
+Simple allowlist of admin emails. Base44 handles login — this entity just controls who gets admin access.
+
+Fields:
+- email (Email, unique)
 
 ### RSVP
 
@@ -697,18 +700,18 @@ Print button (hidden in @media print). Navigation hidden in @media print.
 
 ---
 
-## PAGE: `/admin` (Login)
+## ADMIN ACCESS CONTROL
 
-email (dir="ltr") + password fields. Submit "כניסה".
-Logic: POST to backend → bcrypt.compare password with adminPasswordHash.
-Valid: generate new UUID adminSessionToken, save to EventSettings, return to client, store in localStorage key "adminToken", redirect to /admin/dashboard.
-Invalid: "פרטי הכניסה שגויים"
-After 5 failed attempts: "נחסמת לאחר 5 ניסיונות. נסה שוב בעוד 15 דקות"
-If already logged in (valid token): redirect to /admin/dashboard immediately.
+Login is handled entirely by Base44's built-in auth system. No custom login page needed.
 
-All /admin/* routes: read adminToken from localStorage. Missing → redirect to /admin. Every API call: Authorization: Bearer {token}. If 401: clear localStorage adminToken → redirect to /admin with toast "פג תוקף החיבור, אנא התחברו מחדש".
+On every /admin/* page, check on mount:
+```javascript
+const adminRecord = await AdminUser.filter({ email: currentUser?.email }).first();
+if (!adminRecord) { navigate('/'); return; }
+```
 
-Show persistent warning banner if adminPasswordHash matches hash of default "admin123".
+If not admin: redirect to / with message "אין גישה לעמוד זה".
+If not logged in at all: Base44 will handle the login redirect automatically.
 
 ---
 
@@ -773,9 +776,9 @@ Tab 4 - הודעות ותבניות: thankYouMessage, rsvpClosedMessage, shareIn
 
 Tab 5 - RSVP והגדרות: rsvpButtonText, rsvpFormTitle, rsvpFormIntroText, rsvpOpen toggle, contactName, contactPhone
 
-Tab 6 - חשבון אדמין: change email field, change password (current password + new password + confirm password — must match; bcrypt hash before storing)
-
 Each tab has "שמור" button. Success toast: "נשמר בהצלחה!". Error toast: "שגיאה בשמירה, נסה שוב"
+
+Note: admin user management (adding/removing admin emails) is done directly in the Base44 admin panel, not inside the app.
 
 ---
 
@@ -811,10 +814,9 @@ Loading skeleton: animated grey pulse matching content shape.
 6. OG image — must be absolute URL (https://). Use window.location.origin + relative path if needed.
 7. Gallery — do NOT render the section at all if galleryImages is empty/null.
 8. All visible text comes from EventSettings — never hardcode event-specific content in JSX.
-9. Session expiry — 401 from any admin API → clear adminToken from localStorage → redirect to /admin.
-10. Admin default password warning — show persistent banner if password still matches default.
-11. QR code — encode full URL {origin}/rsvp using react-qr-code or equivalent.
-12. ICS file — generate valid VCALENDAR with DTSTART, DTEND, SUMMARY, DESCRIPTION, LOCATION. Prepend "data:text/calendar;charset=utf-8," for download link.
-13. remindersSent — append {type, sentAt: new Date().toISOString()} and save to RSVP on WhatsApp button click.
-14. Loading states — Skeleton UI on public pages while EventSettings loads; skeleton table rows in admin while RSVP list loads.
+9. Admin access — on every /admin/* page, check: AdminUser.filter({ email: currentUser?.email }).first() — if null, redirect to /.
+10. QR code — encode full URL {origin}/rsvp using react-qr-code or equivalent.
+11. ICS file — generate valid VCALENDAR with DTSTART, DTEND, SUMMARY, DESCRIPTION, LOCATION. Prepend "data:text/calendar;charset=utf-8," for download link.
+12. remindersSent — append {type, sentAt: new Date().toISOString()} and save to RSVP on WhatsApp button click.
+13. Loading states — Skeleton UI on public pages while EventSettings loads; skeleton table rows in admin while RSVP list loads.
 ```
