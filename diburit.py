@@ -35,7 +35,7 @@ import time
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
 
-__version__ = "1.6.1"
+__version__ = "1.7.1"
 
 import numpy as np
 import rumps

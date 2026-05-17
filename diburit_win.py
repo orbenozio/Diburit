@@ -65,7 +65,7 @@ from diburit_core import (
     _transcribe_with_groq,
 )
 
-__version__ = "1.7.0"
+__version__ = "1.7.1"
 
 DEFAULT_SETTINGS: Dict[str, object] = {**_BASE_SETTINGS, "voice": "edge:he-IL-HilaNeural"}
 
