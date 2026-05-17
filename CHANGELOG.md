@@ -9,6 +9,22 @@ macOS, `setup.py` reads `diburit.py::__version__` at build time and writes
 it into `CFBundleVersion` / `CFBundleShortVersionString`. Bump the
 relevant `__version__` and add an entry below when releasing.
 
+## [1.6.1] - 2026-05-17
+
+### Fixed
+- **Recording stuck in "recording" state on macOS 26.x.** `_stop_recording`
+  called `self._stream.stop()` (which maps to PortAudio's `Pa_StopStream`),
+  which under macOS 26.5 with certain input devices waits forever on the
+  CoreAudio HAL IO-proc mutex. Because `_stop_recording` runs on the main
+  thread (drained from `_main_queue`), the entire AppKit runloop froze
+  with the menu-bar icon stuck on the recording state and no `audio.wav`
+  ever written. Sampling the stuck process showed the main thread parked
+  in `AudioOutputUnitStop -> HALB_Mutex::Lock -> __psynch_mutexwait`.
+  Switched to `self._stream.abort()` (`Pa_AbortStream`), which stops the
+  stream immediately without waiting for pending callbacks to drain —
+  fine here because the audio is already captured in `self._buffer` by
+  the input callback. `close()` afterwards is unchanged.
+
 ## [win 1.7.0] - 2026-05-16
 
 First Windows release of Diburit. Brings full feature parity with the

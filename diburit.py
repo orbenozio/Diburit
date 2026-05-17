@@ -35,7 +35,7 @@ import time
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
 
-__version__ = "1.6.0"
+__version__ = "1.6.1"
 
 import numpy as np
 import rumps
@@ -1418,10 +1418,17 @@ class DiburitApp(rumps.App):
         duration = time.monotonic() - self._record_started_at
 
         if self._stream is not None:
+            # `abort()` (Pa_AbortStream) instead of `stop()` (Pa_StopStream)
+            # because the latter waits for the CoreAudio HAL IO-proc mutex
+            # and deadlocks the main runloop under macOS 26.x with certain
+            # input devices — observed live as a `AudioOutputUnitStop ->
+            # HALB_Mutex::Lock` stall on macOS 26.5. abort skips the drain,
+            # which is fine since the audio is already captured in
+            # `self._buffer` via the callback.
             try:
-                self._stream.stop()
+                self._stream.abort()
             except Exception as exc:
-                print(f"[Diburit] error stopping stream: {exc}", file=sys.stderr)
+                print(f"[Diburit] error aborting stream: {exc}", file=sys.stderr)
             try:
                 self._stream.close()
             except Exception as exc:
