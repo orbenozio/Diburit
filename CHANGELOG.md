@@ -4,12 +4,38 @@ All notable changes to Diburit (דיבורית).
 Versions follow [Semantic Versioning](https://semver.org/).
 
 The runtime version lives in `diburit.py::__version__` (macOS) and
-`diburit_win.py::__version__` (Windows) — they move independently. On
-macOS, `setup.py` reads `diburit.py::__version__` at build time and writes
-it into `CFBundleVersion` / `CFBundleShortVersionString`. Bump the
-relevant `__version__` and add an entry below when releasing.
+`diburit_win.py::__version__` (Windows). The two move **together** —
+Diburit is a single project, the macOS and Windows builds are two
+front-ends over the shared `diburit_core.py`, and a release bumps both
+files to the same version even when the change only touches one of
+them. On macOS, `setup.py` reads `diburit.py::__version__` at build
+time and writes it into `CFBundleVersion` / `CFBundleShortVersionString`.
+Bump both `__version__` values and add an entry below when releasing.
 
-## [win 1.7.0] - 2026-05-16
+## [1.7.1] - 2026-05-17
+
+### Fixed
+- **(macOS) Recording stuck in "recording" state on macOS 26.x.** `_stop_recording`
+  called `self._stream.stop()` (which maps to PortAudio's `Pa_StopStream`),
+  which under macOS 26.5 with certain input devices waits forever on the
+  CoreAudio HAL IO-proc mutex. Because `_stop_recording` runs on the main
+  thread (drained from `_main_queue`), the entire AppKit runloop froze
+  with the menu-bar icon stuck on the recording state and no `audio.wav`
+  ever written. Sampling the stuck process showed the main thread parked
+  in `AudioOutputUnitStop -> HALB_Mutex::Lock -> __psynch_mutexwait`.
+  Switched to `self._stream.abort()` (`Pa_AbortStream`), which stops the
+  stream immediately without waiting for pending callbacks to drain —
+  fine here because the audio is already captured in `self._buffer` by
+  the input callback. `close()` afterwards is unchanged.
+
+### Changed
+- **Unified version line across macOS and Windows.** `diburit.py` and
+  `diburit_win.py` now share one `__version__` and one CHANGELOG entry
+  per release, even when a change only touches one platform. The
+  `[win 1.7.0]` heading from the previous Windows port release is
+  renamed to `[1.7.0]` retroactively for consistency.
+
+## [1.7.0] - 2026-05-16
 
 First Windows release of Diburit. Brings full feature parity with the
 macOS app (`Cmd+Shift+M` → `Ctrl+Shift+M`, menu-bar → system-tray) and
