@@ -12,6 +12,65 @@ them. On macOS, `setup.py` reads `diburit.py::__version__` at build
 time and writes it into `CFBundleVersion` / `CFBundleShortVersionString`.
 Bump both `__version__` values and add an entry below when releasing.
 
+## [1.9.0] - 2026-06-09
+
+### Added
+- **Readback speed control on Windows.** The `speech_rate` slider now actually
+  affects the spoken reply. edge-tts voices bake the tempo into the render
+  (`rate='+N%'`, tempo change without pitch shift), played back at native
+  speed; pygame can't re-time an already-rendered MP3, which is why the slider
+  did nothing before. gTTS still has no fine rate control (engine limitation) -
+  use an edge voice for speed control. New shared helper `edge_rate_str()`.
+- **Gradual typing delivery mode.** New `paste_mode` setting (`paste` default /
+  `type`) plus a `type_cps` typing-speed setting and prefs-window controls.
+  In `type` mode the transcript is injected character-by-character (a human
+  typing effect) instead of an instant Ctrl+V. Implemented in
+  `platform_compat.type_text` via SendInput `KEYEVENTF_UNICODE` (layout-
+  independent, so Hebrew injects under any layout; newlines sent as VK_RETURN).
+  Speed is capped at 40 cps because SendInput starts dropping/duplicating
+  characters past ~50 cps. The text is still placed on the clipboard first, so
+  a manual paste fallback remains.
+
+### Fixed
+- **TTS readback was silent on Windows.** The Stop-hook fired correctly,
+  detected the Diburit dictation, picked the text, and rendered the MP3, but
+  no audio was ever heard. `_afplay_nonblocking` played through a pygame
+  daemon thread inside the hook's own process; that process exits the instant
+  `speak()` returns, killing the thread before playback was audible. Windows
+  now spawns a detached child process via `pythonw.exe` + `CREATE_NO_WINDOW`
+  that owns the pygame playback and survives the hook's exit (and never flashes
+  a console window) - the Windows analogue of macOS's `start_new_session`
+  afplay. macOS playback is unchanged.
+
+## [1.8.0] - 2026-05-31
+
+Adds a **local, offline transcription backend** so Diburit can be distributed
+without every user needing a Groq API key or paying per use. Local is now the
+default; Groq becomes an opt-in "power user" backend.
+
+### Added
+- **Local transcription backend (`faster-whisper`).** New `transcribe()`
+  dispatcher in `diburit_core.py` routes to either the local engine or Groq
+  based on the `transcription_backend` setting (`local` default / `groq`).
+  CTranslate2-based, so it does **not** pull in PyTorch and the install stays
+  small.
+- **Selectable local model (`local_model` setting).** Registry of five
+  choices, defaulting to ivrit.ai's Hebrew-tuned
+  `whisper-large-v3-turbo-ct2`. Also offers `ivrit-large` and stock Whisper
+  `large-v3` / `medium` / `small`. Models load as `int8` so they run on CPU
+  (no GPU required); each is downloaded from Hugging Face on first use.
+- **Preferences UI (Windows).** Transcription-engine and local-model
+  dropdowns wired into the `tkinter` preferences window; the model picker is
+  greyed out under the Groq backend. Selecting Groq with no `GROQ_API_KEY`
+  present surfaces a one-time notice.
+- **`faster-whisper` in `requirements.txt` / `requirements_win.txt`.**
+
+### Changed
+- **No API key needed by default.** `~/Diburit/.env` / `GROQ_API_KEY` is now
+  optional — required only when the Groq backend is selected.
+- **README rewritten** as a cross-platform doc leading with the offline,
+  no-key, no-cost local default and documenting the backend/model choice.
+
 ## [1.7.1] - 2026-05-17
 
 ### Fixed
@@ -193,6 +252,27 @@ adds polish needed for daily use on Windows.
 - Menu submenu builder factored the "what counts as a non-`say` voice"
   check into `current_is_remote` so adding the next backend is a
   one-line change.
+
+## [tts_assistant 1.4.0] - 2026-06-09
+
+Fixes the Windows readback silently never firing, and makes the
+dictation-to-message match tolerant of small post-paste edits.
+
+### Fixed
+- **`_resolve_latest_dir` now prefers `latest.txt` over the `latest`
+  symlink on Windows.** The symlink can freeze at an old recording when
+  `os.replace` over the existing dir-symlink fails (Developer Mode quirk),
+  so reading it returned stale metadata and the hook stayed silent. The
+  reliable plain-text pointer is now read first; the symlink is the
+  fallback. (Paired with `diburit_core._repoint_latest` always writing
+  `latest.txt` and cleaning up the orphaned `latest.tmp`.)
+
+### Changed
+- **Fuzzy transcript match (`_transcript_matches`, char-level coverage ≥
+  `TRANSCRIPT_MATCH_MIN_COVERAGE=0.75`).** Replaces the exact-substring
+  check so a fixed typo or a corrected word after pasting no longer breaks
+  the readback, while a message typed from scratch still falls short and
+  won't trigger a false readback.
 
 ## [tts_assistant 1.3.1] - 2026-05-13
 

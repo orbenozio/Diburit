@@ -10,6 +10,11 @@ python-dotenv
 edge-tts
 gtts
 
+# ── Local transcription (default backend — no API key, runs offline) ─────────
+# CTranslate2-based; does NOT pull in PyTorch, so the install stays small.
+# Only needed for the "local" backend; users on the Groq backend can omit it.
+faster-whisper>=1.0.0
+
 # ── Windows UI / system tray ─────────────────────────────────────────────────
 pystray>=0.19.5
 Pillow>=10.0.0          # pystray needs PIL for tray icons

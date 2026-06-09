@@ -25,7 +25,11 @@ from diburit_core import (
     HOTKEY_MODE_PTT,
     HOTKEY_MODE_TOGGLE,
     MAX_SPEECH_RATE,
+    MAX_TYPE_CPS,
     MIN_SPEECH_RATE,
+    MIN_TYPE_CPS,
+    PASTE_MODE_PASTE,
+    PASTE_MODE_TYPE,
     SILENCE_PEAK_THRESHOLD,
     _BASE_SETTINGS,
     _atomic_write,
@@ -33,6 +37,7 @@ from diburit_core import (
     _is_silence_hallucination,
     _load_settings,
     _prune_recordings,
+    edge_rate_str,
 )
 
 
@@ -166,6 +171,30 @@ class TestLoadSettings(unittest.TestCase):
             _write(p, json.dumps({"speech_rate": 0.0}))
             self.assertEqual(self._load(p)["speech_rate"], MIN_SPEECH_RATE)
 
+    def test_paste_mode_valid_loaded(self):
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td) / "settings.json"
+            _write(p, json.dumps({"paste_mode": PASTE_MODE_TYPE}))
+            self.assertEqual(self._load(p)["paste_mode"], PASTE_MODE_TYPE)
+
+    def test_paste_mode_invalid_falls_back_to_default(self):
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td) / "settings.json"
+            _write(p, json.dumps({"paste_mode": "bogus"}))
+            self.assertEqual(self._load(p)["paste_mode"], PASTE_MODE_PASTE)
+
+    def test_type_cps_clamped_high(self):
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td) / "settings.json"
+            _write(p, json.dumps({"type_cps": 9999}))
+            self.assertEqual(self._load(p)["type_cps"], MAX_TYPE_CPS)
+
+    def test_type_cps_clamped_low(self):
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td) / "settings.json"
+            _write(p, json.dumps({"type_cps": 0}))
+            self.assertEqual(self._load(p)["type_cps"], MIN_TYPE_CPS)
+
     def test_max_recordings_clamped_low(self):
         with tempfile.TemporaryDirectory() as td:
             p = Path(td) / "settings.json"
@@ -192,6 +221,36 @@ class TestLoadSettings(unittest.TestCase):
             result = self._load(p)
             self.assertEqual(result["voice"], "TestVoice")
 
+    def test_valid_backend_loaded(self):
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td) / "settings.json"
+            _write(p, json.dumps({"transcription_backend": "groq"}))
+            self.assertEqual(self._load(p)["transcription_backend"], "groq")
+
+    def test_unknown_backend_ignored(self):
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td) / "settings.json"
+            _write(p, json.dumps({"transcription_backend": "bogus"}))
+            self.assertEqual(
+                self._load(p)["transcription_backend"],
+                _BASE_SETTINGS["transcription_backend"],
+            )
+
+    def test_valid_local_model_loaded(self):
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td) / "settings.json"
+            _write(p, json.dumps({"local_model": "ivrit-large"}))
+            self.assertEqual(self._load(p)["local_model"], "ivrit-large")
+
+    def test_unknown_local_model_ignored(self):
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td) / "settings.json"
+            _write(p, json.dumps({"local_model": "not-a-model"}))
+            self.assertEqual(
+                self._load(p)["local_model"],
+                _BASE_SETTINGS["local_model"],
+            )
+
     def test_platform_default_voice_respected(self):
         with tempfile.TemporaryDirectory() as td:
             missing = Path(td) / "nonexistent.json"
@@ -206,6 +265,30 @@ class TestLoadSettings(unittest.TestCase):
             _write(p, json.dumps([1, 2, 3]))
             result = self._load(p)
             self.assertAlmostEqual(result["volume"], _BASE_SETTINGS["volume"])
+
+
+# ---------------------------------------------------------------------------
+# 2b. edge_rate_str
+# ---------------------------------------------------------------------------
+
+class TestEdgeRateStr(unittest.TestCase):
+
+    def test_normal_is_zero_percent(self):
+        self.assertEqual(edge_rate_str(1.0), "+0%")
+
+    def test_faster_is_positive(self):
+        self.assertEqual(edge_rate_str(1.5), "+50%")
+
+    def test_slower_is_negative(self):
+        self.assertEqual(edge_rate_str(0.8), "-20%")
+
+    def test_clamped_to_speech_rate_bounds(self):
+        self.assertEqual(edge_rate_str(99.0), f"{round((MAX_SPEECH_RATE - 1.0) * 100):+d}%")
+        self.assertEqual(edge_rate_str(0.0), f"{round((MIN_SPEECH_RATE - 1.0) * 100):+d}%")
+
+    def test_always_has_explicit_sign(self):
+        for r in (0.5, 1.0, 1.2, 2.5):
+            self.assertIn(edge_rate_str(r)[0], "+-")
 
 
 # ---------------------------------------------------------------------------

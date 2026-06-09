@@ -35,7 +35,7 @@ import time
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
 
-__version__ = "1.7.1"
+__version__ = "1.9.0"
 
 import numpy as np
 import rumps
@@ -130,7 +130,7 @@ from diburit_core import (
     _prune_recordings,
     _repoint_latest,
     _save_settings,
-    _transcribe_with_groq,
+    transcribe,
 )
 
 # ---- paths & constants --------------------------------------------------
@@ -1039,6 +1039,8 @@ class DiburitApp(rumps.App):
         self.max_recordings_kept: int = int(settings.get("max_recordings_kept", 100))  # type: ignore[arg-type]
         self.speech_rate: float = float(settings.get("speech_rate", DEFAULT_SETTINGS["speech_rate"]))  # type: ignore[arg-type]
         self.show_status_rows: bool = bool(settings.get("show_status_rows", DEFAULT_SETTINGS["show_status_rows"]))
+        self.transcription_backend: str = str(settings.get("transcription_backend", DEFAULT_SETTINGS["transcription_backend"]))
+        self.local_model: str = str(settings.get("local_model", DEFAULT_SETTINGS["local_model"]))
 
         # Live state - all mutated only from the main thread.
         self.enabled: bool = True
@@ -1110,6 +1112,8 @@ class DiburitApp(rumps.App):
             "max_recordings_kept": self.max_recordings_kept,
             "speech_rate": self.speech_rate,
             "show_status_rows": self.show_status_rows,
+            "transcription_backend": self.transcription_backend,
+            "local_model": self.local_model,
         })
 
     # ---- menu rendering -----------------------------------------------
@@ -1481,7 +1485,7 @@ class DiburitApp(rumps.App):
 
     def _transcribe_worker(self, utterance: Utterance) -> None:
         try:
-            text = _transcribe_with_groq(utterance.audio_path)
+            text = transcribe(utterance.audio_path, self.transcription_backend, self.local_model)
         except Exception as exc:
             print(f"[Diburit] transcription failed: {exc}", file=sys.stderr)
             _notify("Diburit", f"Transcription failed: {str(exc)[:120]}")

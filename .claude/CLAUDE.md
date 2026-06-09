@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-Diburit (דיבורית) is a Hebrew dictation app that ships on both macOS and Windows. A global hotkey records 16 kHz mono audio via `sounddevice`, sends it to Groq Whisper-large-v3 (`language=he`) for transcription, copies the result to the clipboard, then injects Cmd+V (macOS) / Ctrl+V (Windows) into the frontmost app. On macOS it builds as a py2app bundle (Python 3.9) with a signed identity (`com.orbenozio.diburit`) so TCC keeps Microphone / Accessibility / AppleEvents permissions stable across rebuilds — the whole reason this project exists, replacing the SayHE/SayIt prototypes that hit unfixable TCC attribution issues.
+Diburit (דיבורית) is a Hebrew dictation app that ships on both macOS and Windows. A global hotkey records 16 kHz mono audio via `sounddevice`, transcribes it (`language=he`), copies the result to the clipboard, then injects Cmd+V (macOS) / Ctrl+V (Windows) into the frontmost app. Transcription has two backends selected via the `transcription_backend` setting and dispatched by `diburit_core.transcribe()`: **`local`** (default — `faster-whisper`/CTranslate2 on-device, no API key, no cost, offline; model chosen via `local_model`, default ivrit.ai `whisper-large-v3-turbo-ct2`, loaded `int8` on CPU, downloaded from HuggingFace on first use) and **`groq`** (Groq Whisper-large-v3 cloud, needs `GROQ_API_KEY`, pays per use). Local is the default so the app can be distributed without per-user keys or cost. On macOS it builds as a py2app bundle (Python 3.9) with a signed identity (`com.orbenozio.diburit`) so TCC keeps Microphone / Accessibility / AppleEvents permissions stable across rebuilds — the whole reason this project exists, replacing the SayHE/SayIt prototypes that hit unfixable TCC attribution issues.
 
 Companion piece: `tts_assistant.py` is a Claude Code Stop hook that watches `~/Diburit/latest/metadata.json`, detects when the previous user turn was a Diburit paste, and speaks Claude's reply back through `say -v Carmit` + `afplay` (macOS) or `edge-tts` / `gTTS` / `pyttsx3` + `pygame` (Windows).
 
@@ -11,7 +11,7 @@ Current versions (independent): `diburit.py::__version__` (macOS) and `diburit_w
 ## Key Files
 
 ### Shared
-- [diburit_core.py](diburit_core.py) — platform-neutral core: `Utterance`, settings load/save, Groq transcription, silence detection, pruning, atomic writes, recordings layout. Imported by both `diburit.py` and `diburit_win.py`.
+- [diburit_core.py](diburit_core.py) — platform-neutral core: `Utterance`, settings load/save, the `transcribe()` backend dispatcher (`local` faster-whisper / `groq` cloud) + `LOCAL_MODELS` registry, silence detection, pruning, atomic writes, recordings layout. Imported by both `diburit.py` and `diburit_win.py`.
 - [platform_compat.py](platform_compat.py) — `sys.platform` shim for clipboard, paste, frontmost-app, notifications, audio playback. Every platform-specific import is **local** inside its function (importing `Quartz` on Windows crashes; importing `win32gui` on macOS crashes).
 - [tts_assistant.py](tts_assistant.py) — Claude Code Stop hook. Three-tier readback (SHORT ≤ 220 chars → whole text; PUNCHLINE → last paragraph/sentence; COMPLEX → Groq Llama 3.3 70B summary in 1–2 Hebrew sentences). Uses `fcntl.flock` (macOS) / `filelock` (Windows) on a sibling lockfile to prevent double-speak when the hook fires twice back-to-back.
 - [CHANGELOG.md](CHANGELOG.md) — bump the relevant `__version__` (macOS and Windows are independent) and add an entry on every release.

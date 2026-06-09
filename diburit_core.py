@@ -39,20 +39,103 @@ CHANNELS    = 1
 DTYPE       = "int16"
 
 # ---------------------------------------------------------------------------
-# Groq / transcription
+# Transcription — shared
 # ---------------------------------------------------------------------------
 
-GROQ_URL      = "https://api.groq.com/openai/v1/audio/transcriptions"
-GROQ_MODEL    = "whisper-large-v3"
-GROQ_LANGUAGE = "he"
-GROQ_TIMEOUT  = 60
-GROQ_PROMPT   = (
+TRANSCRIBE_LANGUAGE = "he"
+
+# Hebrew vocabulary hint: keep English technical terms in Latin script instead
+# of transliterating them. Used as the Groq `prompt` and the faster-whisper
+# `initial_prompt` alike.
+HEBREW_PROMPT = (
     "זה תמלול של דובר עברית שמשתמש לעיתים במונחים טכניים באנגלית. "
     "מילים כמו commit, git, terminal, install, function, class, repo, "
     "branch, pull request, debug, script, file, folder, server, build, "
     "deploy, log, hook, prompt, token, cache, queue, callback, README — "
     "השאר אותן באנגלית, לא בתעתיק עברי."
 )
+
+# Backwards-compat aliases (older code / tests referenced these names).
+GROQ_PROMPT = HEBREW_PROMPT
+GROQ_LANGUAGE = TRANSCRIBE_LANGUAGE
+
+# Which engine turns audio into text.
+#   "local" — faster-whisper running on this machine. No API key, no cost,
+#             works offline. The default so a fresh install just works.
+#   "groq"  — Groq cloud Whisper-large-v3. Fastest + best Hebrew, but each
+#             user needs their own GROQ_API_KEY and pays per use.
+BACKEND_LOCAL = "local"
+BACKEND_GROQ  = "groq"
+_BACKENDS     = frozenset({BACKEND_LOCAL, BACKEND_GROQ})
+DEFAULT_BACKEND = BACKEND_LOCAL
+
+# ---------------------------------------------------------------------------
+# Groq backend
+# ---------------------------------------------------------------------------
+
+GROQ_URL     = "https://api.groq.com/openai/v1/audio/transcriptions"
+GROQ_MODEL   = "whisper-large-v3"
+GROQ_TIMEOUT = 60
+
+# ---------------------------------------------------------------------------
+# Local backend (faster-whisper / CTranslate2)
+# ---------------------------------------------------------------------------
+
+# User-selectable local models. Key → (repo-or-name, human label).
+# ivrit.ai models are Hebrew fine-tunes of Whisper, shipped in CTranslate2
+# format so faster-whisper loads them directly. The plain Whisper sizes are
+# multilingual fallbacks for users who want a smaller/lighter download.
+LOCAL_MODELS: Dict[str, Tuple[str, str]] = {
+    "ivrit-turbo": ("ivrit-ai/whisper-large-v3-turbo-ct2",
+                    "ivrit.ai Turbo — Hebrew-tuned, fast (recommended)"),
+    "ivrit-large": ("ivrit-ai/whisper-large-v3-ct2",
+                    "ivrit.ai Large-v3 — Hebrew-tuned, most accurate (heavy)"),
+    "whisper-large-v3": ("large-v3",
+                    "Whisper large-v3 — multilingual, heavy"),
+    "whisper-medium": ("medium",
+                    "Whisper medium — multilingual, lighter"),
+    "whisper-small": ("small",
+                    "Whisper small — multilingual, fastest/least accurate"),
+}
+DEFAULT_LOCAL_MODEL = "ivrit-turbo"
+
+# int8 keeps the model small in RAM and runs on CPU (most Windows users have
+# no CUDA GPU). On a machine with a supported GPU, faster-whisper still works;
+# this stays correct, just leaves speed on the table.
+LOCAL_COMPUTE_TYPE = "int8"
+LOCAL_DEVICE       = "cpu"
+
+# WhisperModel load is expensive (reads weights off disk); cache per model key
+# so we pay it once, not per utterance.
+_local_model_cache: Dict[str, object] = {}
+
+
+def local_model_label(model_key: str) -> str:
+    entry = LOCAL_MODELS.get(model_key) or LOCAL_MODELS[DEFAULT_LOCAL_MODEL]
+    return entry[1]
+
+
+def _load_local_model(model_key: str):
+    """Lazily import faster-whisper and load (and cache) the requested model.
+    The import is deferred so machines that only ever use the Groq backend
+    don't need faster-whisper installed at all."""
+    cached = _local_model_cache.get(model_key)
+    if cached is not None:
+        return cached
+    try:
+        from faster_whisper import WhisperModel  # type: ignore
+    except ImportError as exc:
+        raise RuntimeError(
+            "Local transcription needs faster-whisper. Install it with "
+            "`pip install faster-whisper`, or switch the backend to Groq "
+            "in settings."
+        ) from exc
+    repo = (LOCAL_MODELS.get(model_key) or LOCAL_MODELS[DEFAULT_LOCAL_MODEL])[0]
+    # First load for a model downloads it from HuggingFace (cached under
+    # ~/.cache/huggingface afterwards). This can take a while and needs net.
+    model = WhisperModel(repo, device=LOCAL_DEVICE, compute_type=LOCAL_COMPUTE_TYPE)
+    _local_model_cache[model_key] = model
+    return model
 
 # ---------------------------------------------------------------------------
 # Tuning knobs
@@ -90,14 +173,31 @@ MIN_SPEECH_RATE        = 0.5
 MAX_SPEECH_RATE        = 2.5
 MAX_RECORDINGS_PRESETS: List[int] = [25, 50, 100, 250, 500, 1000]
 
+# How the transcript reaches the target app once transcribed.
+PASTE_MODE_PASTE = "paste"  # instant Ctrl+V / Cmd+V of the whole text (default)
+PASTE_MODE_TYPE  = "type"   # injected character-by-character (human-typing feel)
+_PASTE_MODES = (PASTE_MODE_PASTE, PASTE_MODE_TYPE)
+# Typing speed for PASTE_MODE_TYPE, in characters per second. The ceiling is
+# deliberately conservative: SendInput injection starts dropping/duplicating
+# characters past ~50 cps on Notepad (and heavier targets like Electron/VS Code
+# have even less headroom), so 40 keeps a safety margin. The default is a brisk
+# but reliable type-out; the floor is a slow, deliberate human pace.
+MIN_TYPE_CPS     = 5.0
+MAX_TYPE_CPS     = 40.0
+DEFAULT_TYPE_CPS = 25.0
+
 # Base settings shared by both platforms. Each platform adds its own `voice`.
 _BASE_SETTINGS: Dict[str, object] = {
-    "volume":              0.8,
-    "hotkey":              "<cmd>+<shift>+m",
-    "hotkey_mode":         HOTKEY_MODE_TOGGLE,
-    "max_recordings_kept": 100,
-    "speech_rate":         1.0,
-    "show_status_rows":    True,
+    "volume":                  0.8,
+    "hotkey":                  "<cmd>+<shift>+m",
+    "hotkey_mode":             HOTKEY_MODE_TOGGLE,
+    "max_recordings_kept":     100,
+    "speech_rate":             1.0,
+    "show_status_rows":        True,
+    "transcription_backend":   DEFAULT_BACKEND,
+    "local_model":             DEFAULT_LOCAL_MODEL,
+    "paste_mode":              PASTE_MODE_PASTE,
+    "type_cps":                DEFAULT_TYPE_CPS,
 }
 
 # ---------------------------------------------------------------------------
@@ -116,6 +216,15 @@ EDGE_HEBREW_VOICES: List[Tuple[str, str]] = [
 GTTS_HEBREW_VOICES: List[Tuple[str, str]] = [
     ("Hebrew (gTTS)", f"{GTTS_PREFIX}iw"),
 ]
+
+
+def edge_rate_str(rate: float) -> str:
+    """Convert a speech-rate multiplier (1.0 = normal) into the percentage
+    string edge-tts expects (e.g. 1.5 -> '+50%', 0.8 -> '-20%', 1.0 -> '+0%').
+    edge-tts changes tempo at render time without shifting pitch, which is how
+    Windows gets real readback-speed control (pygame can't re-time an MP3)."""
+    r = max(MIN_SPEECH_RATE, min(rate, MAX_SPEECH_RATE))
+    return f"{round((r - 1.0) * 100):+d}%"
 
 # ---------------------------------------------------------------------------
 # Atomic file write
@@ -177,6 +286,20 @@ def _load_settings(
         pass
     if isinstance(on_disk.get("show_status_rows"), bool):
         data["show_status_rows"] = on_disk["show_status_rows"]
+    backend = on_disk.get("transcription_backend")
+    if isinstance(backend, str) and backend in _BACKENDS:
+        data["transcription_backend"] = backend
+    model = on_disk.get("local_model")
+    if isinstance(model, str) and model in LOCAL_MODELS:
+        data["local_model"] = model
+    pmode = on_disk.get("paste_mode")
+    if isinstance(pmode, str) and pmode in _PASTE_MODES:
+        data["paste_mode"] = pmode
+    try:
+        cps = float(on_disk.get("type_cps", defaults["type_cps"]))  # type: ignore
+        data["type_cps"] = max(MIN_TYPE_CPS, min(cps, MAX_TYPE_CPS))
+    except (TypeError, ValueError):
+        pass
     return data
 
 
@@ -240,6 +363,30 @@ def _transcribe_with_groq(wav_path: Path) -> str:
     raise last_err or RuntimeError("transcription failed")
 
 
+def _transcribe_with_local(wav_path: Path, model_key: str = DEFAULT_LOCAL_MODEL) -> str:
+    model = _load_local_model(model_key)
+    segments, _info = model.transcribe(
+        str(wav_path),
+        language=TRANSCRIBE_LANGUAGE,
+        initial_prompt=HEBREW_PROMPT,
+        vad_filter=True,
+    )
+    return "".join(seg.text for seg in segments).strip()
+
+
+def transcribe(
+    wav_path: Path,
+    backend: str = DEFAULT_BACKEND,
+    local_model: str = DEFAULT_LOCAL_MODEL,
+) -> str:
+    """Turn a WAV file into Hebrew text using the configured backend.
+    Single entry point both platform apps call — keeps the backend choice in
+    one place instead of branching inside each `_transcribe_worker`."""
+    if backend == BACKEND_GROQ:
+        return _transcribe_with_groq(wav_path)
+    return _transcribe_with_local(wav_path, local_model)
+
+
 # ---------------------------------------------------------------------------
 # Utterance / recordings
 # ---------------------------------------------------------------------------
@@ -287,18 +434,33 @@ class Utterance:
 
 
 def _repoint_latest(target_dir: Path, diburit_home: Path = DIBURIT_HOME) -> None:
-    """Point ~/Diburit/latest at target_dir. Tries symlink first; falls back
-    to latest.txt on systems where symlinks require elevated rights."""
+    """Point ~/Diburit/latest at target_dir.
+
+    Always writes latest.txt (a plain-text pointer that's reliable on every
+    platform) and best-effort maintains the `latest` symlink. On Windows,
+    os.replace over an existing directory symlink can fail even when symlink
+    *creation* succeeds — that would leave `latest` frozen at an old recording
+    while only latest.txt advances, which is exactly what silently broke the
+    TTS hook. latest.txt is therefore the source of truth the hook trusts."""
     latest_link = diburit_home / "latest"
     latest_txt  = diburit_home / "latest.txt"
+    # Reliable pointer first.
+    _atomic_write(latest_txt, str(target_dir))
+    # Best-effort symlink (primary on macOS; nice-to-have on Windows).
+    tmp = latest_link.with_name("latest.tmp")
     try:
-        tmp = latest_link.with_name("latest.tmp")
         if tmp.exists() or tmp.is_symlink():
             tmp.unlink()
         tmp.symlink_to(target_dir, target_is_directory=True)
         os.replace(tmp, latest_link)
     except OSError:
-        _atomic_write(latest_txt, str(target_dir))
+        # Symlink unsupported or replace failed; latest.txt already covers it.
+        # Remove the orphaned tmp symlink so it doesn't accumulate.
+        try:
+            if tmp.is_symlink() or tmp.exists():
+                tmp.unlink()
+        except OSError:
+            pass
 
 
 def _prune_recordings(keep_n: int, recordings_dir: Path = RECORDINGS_DIR) -> None:

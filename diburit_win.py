@@ -31,20 +31,29 @@ from pynput import keyboard as kb
 
 import platform_compat
 from diburit_core import (
+    BACKEND_GROQ,
+    BACKEND_LOCAL,
+    DEFAULT_LOCAL_MODEL,
     DIBURIT_HOME,
     DTYPE,
     EDGE_HEBREW_VOICES,
     EDGE_PREFIX,
+    edge_rate_str,
     FOCUS_SETTLE_SEC,
     GROQ_PROMPT,
     GTTS_HEBREW_VOICES,
+    LOCAL_MODELS,
     GTTS_PREFIX,
     HOTKEY_MODE_PTT,
     HOTKEY_MODE_TOGGLE,
     MAX_RECORDINGS_PRESETS,
     MAX_SPEECH_RATE,
+    MAX_TYPE_CPS,
     MIN_SPEECH_RATE,
+    MIN_TYPE_CPS,
     NOTIFICATION_PREVIEW_CHARS,
+    PASTE_MODE_PASTE,
+    PASTE_MODE_TYPE,
     PTT_MIN_HOLD_SEC,
     QUIT_TRANSCRIBE_GRACE_SEC,
     RECORDINGS_DIR,
@@ -62,12 +71,24 @@ from diburit_core import (
     _prune_recordings,
     _repoint_latest,
     _save_settings,
-    _transcribe_with_groq,
+    transcribe,
 )
 
-__version__ = "1.7.1"
+__version__ = "1.9.0"
 
 DEFAULT_SETTINGS: Dict[str, object] = {**_BASE_SETTINGS, "voice": "edge:he-IL-HilaNeural"}
+
+# Human-facing labels for the transcription-backend picker.
+_BACKEND_LABELS = {
+    BACKEND_LOCAL: "Local — offline, no API key",
+    BACKEND_GROQ:  "Groq — cloud, needs API key",
+}
+
+# Human-facing labels for the delivery-mode picker.
+_DELIVERY_LABELS = {
+    PASTE_MODE_PASTE: "Paste (instant)",
+    PASTE_MODE_TYPE:  "Type out (gradual)",
+}
 
 CHANNELS = 1
 
@@ -280,11 +301,13 @@ def _play_sample(text: str, voice: str, volume: float, rate: float = 1.0) -> Non
             return
         tmp_mp3 = Path(_tempfile.mktemp(suffix=".mp3", dir=str(DIBURIT_HOME)))
         async def _run() -> None:
-            await edge_tts.Communicate(text, edge_voice).save(str(tmp_mp3))
+            # rate baked into the render (tempo without pitch shift); play back
+            # at native speed so the sample matches what the readback will sound.
+            await edge_tts.Communicate(text, edge_voice, rate=edge_rate_str(rate)).save(str(tmp_mp3))
         try:
             asyncio.run(asyncio.wait_for(_run(), timeout=15))
             if tmp_mp3.exists() and tmp_mp3.stat().st_size > 0:
-                platform_compat.play_audio_nonblocking(tmp_mp3, volume, rate)
+                platform_compat.play_audio_nonblocking(tmp_mp3, volume, 1.0)
         except Exception as exc:
             print(f"[Diburit] edge preview failed: {exc}", file=sys.stderr)
         return
@@ -401,16 +424,61 @@ class PrefsWindow:
         max_e.bind("<FocusOut>", self._on_max_changed)
         max_e.bind("<Return>",   self._on_max_changed)
 
+        # Transcription engine
+        lbl("Transcription:", 5)
+        self._backend_var = tk.StringVar()
+        self._backend_combo = ttk.Combobox(
+            f, textvariable=self._backend_var, width=34, state="readonly",
+            values=[_BACKEND_LABELS[BACKEND_LOCAL], _BACKEND_LABELS[BACKEND_GROQ]],
+        )
+        self._backend_combo.grid(row=5, column=1, sticky="w")
+        self._backend_combo.bind("<<ComboboxSelected>>", self._on_backend_changed)
+
+        # Local model (only meaningful when backend == local)
+        lbl("Local model:", 6)
+        self._model_keys: List[str] = list(LOCAL_MODELS.keys())
+        self._model_var = tk.StringVar()
+        self._model_combo = ttk.Combobox(
+            f, textvariable=self._model_var, width=34, state="readonly",
+            values=[LOCAL_MODELS[k][1] for k in self._model_keys],
+        )
+        self._model_combo.grid(row=6, column=1, sticky="w")
+        self._model_combo.bind("<<ComboboxSelected>>", self._on_model_changed)
+
+        # Delivery mode (instant paste vs. gradual typing)
+        lbl("Delivery:", 7)
+        self._delivery_var = tk.StringVar()
+        self._delivery_combo = ttk.Combobox(
+            f, textvariable=self._delivery_var, width=34, state="readonly",
+            values=[_DELIVERY_LABELS[PASTE_MODE_PASTE], _DELIVERY_LABELS[PASTE_MODE_TYPE]],
+        )
+        self._delivery_combo.grid(row=7, column=1, sticky="w")
+        self._delivery_combo.bind("<<ComboboxSelected>>", self._on_delivery_changed)
+
+        # Typing speed (only meaningful in 'type' delivery mode)
+        lbl("Typing speed:", 8)
+        typ_f = ttk.Frame(f)
+        typ_f.grid(row=8, column=1, sticky="w")
+        self._typecps_var = tk.DoubleVar()
+        self._typecps_slider = ttk.Scale(
+            typ_f, from_=MIN_TYPE_CPS, to=MAX_TYPE_CPS,
+            variable=self._typecps_var, length=200,
+            command=self._on_typecps_changed,
+        )
+        self._typecps_slider.pack(side="left")
+        self._typecps_lbl = ttk.Label(typ_f, text="25 cps", width=8)
+        self._typecps_lbl.pack(side="left")
+
         # Show status rows
         self._show_var = tk.BooleanVar()
         ttk.Checkbutton(
             f, text="Show Last & Transcript in tray menu",
             variable=self._show_var, command=self._on_show_status_changed,
-        ).grid(row=5, column=0, columnspan=2, sticky="w", padx=(0, 0), pady=(6, 2))
+        ).grid(row=9, column=0, columnspan=2, sticky="w", padx=(0, 0), pady=(6, 2))
 
         # Buttons
         btn_f = ttk.Frame(f)
-        btn_f.grid(row=6, column=0, columnspan=2, pady=(12, 0))
+        btn_f.grid(row=10, column=0, columnspan=2, pady=(12, 0))
         ttk.Button(btn_f, text="Prune Recordings Now", command=self._on_prune).pack(side="left", padx=4)
         ttk.Button(btn_f, text="Done", command=self._on_done).pack(side="left", padx=4)
 
@@ -441,7 +509,69 @@ class PrefsWindow:
         self._max_var.set(str(a.max_recordings_kept))
         self._show_var.set(a.show_status_rows)
 
+        self._backend_var.set(_BACKEND_LABELS.get(a.transcription_backend, _BACKEND_LABELS[BACKEND_LOCAL]))
+        model_key = a.local_model if a.local_model in self._model_keys else DEFAULT_LOCAL_MODEL
+        self._model_var.set(LOCAL_MODELS[model_key][1])
+        self._sync_model_enabled()
+
+        self._delivery_var.set(_DELIVERY_LABELS.get(a.paste_mode, _DELIVERY_LABELS[PASTE_MODE_PASTE]))
+        self._typecps_var.set(a.type_cps)
+        self._typecps_lbl.config(text=f"{a.type_cps:.0f} cps")
+        self._sync_typecps_enabled()
+
     # ── actions ────────────────────────────────────────────────────────────
+
+    def _sync_model_enabled(self) -> None:
+        # The local-model picker only matters for the local backend; grey it
+        # out under Groq so it's clear it has no effect there.
+        state = "readonly" if self._app.transcription_backend == BACKEND_LOCAL else "disabled"
+        self._model_combo.config(state=state)
+
+    def _sync_typecps_enabled(self) -> None:
+        # The typing-speed slider only matters in 'type' delivery mode; grey it
+        # out under instant paste so it's clear it has no effect there.
+        state = "normal" if self._app.paste_mode == PASTE_MODE_TYPE else "disabled"
+        self._typecps_slider.config(state=state)
+
+    def _on_delivery_changed(self, _event=None) -> None:
+        chosen = self._delivery_var.get()
+        mode = next((k for k, v in _DELIVERY_LABELS.items() if v == chosen), PASTE_MODE_PASTE)
+        if mode == self._app.paste_mode:
+            return
+        self._app.paste_mode = mode
+        self._app._persist_settings()
+        self._sync_typecps_enabled()
+
+    def _on_typecps_changed(self, _val=None) -> None:
+        v = round(float(self._typecps_var.get()))
+        v = max(MIN_TYPE_CPS, min(v, MAX_TYPE_CPS))
+        self._app.type_cps = v
+        self._app._persist_settings()
+        self._typecps_lbl.config(text=f"{v:.0f} cps")
+
+    def _on_backend_changed(self, _event=None) -> None:
+        chosen = self._backend_var.get()
+        backend = next((k for k, v in _BACKEND_LABELS.items() if v == chosen), BACKEND_LOCAL)
+        if backend == self._app.transcription_backend:
+            return
+        self._app.transcription_backend = backend
+        self._app._persist_settings()
+        self._sync_model_enabled()
+        if backend == BACKEND_GROQ and not os.environ.get("GROQ_API_KEY"):
+            platform_compat.notify(
+                "Diburit",
+                "Groq backend selected, but no GROQ_API_KEY in ~/Diburit/.env",
+            )
+
+    def _on_model_changed(self, _event=None) -> None:
+        idx = self._model_combo.current()
+        if not (0 <= idx < len(self._model_keys)):
+            return
+        key = self._model_keys[idx]
+        if key == self._app.local_model:
+            return
+        self._app.local_model = key
+        self._app._persist_settings()
 
     def _on_voice_changed(self, _event=None) -> None:
         idx = self._voice_combo.current()
@@ -579,6 +709,10 @@ class DiburitApp:
         self.max_recordings_kept: int  = int(settings.get("max_recordings_kept", 100))  # type: ignore
         self.speech_rate:        float = float(settings.get("speech_rate",       DEFAULT_SETTINGS["speech_rate"]))  # type: ignore
         self.show_status_rows:   bool  = bool(settings.get("show_status_rows",   DEFAULT_SETTINGS["show_status_rows"]))
+        self.transcription_backend: str = str(settings.get("transcription_backend", DEFAULT_SETTINGS["transcription_backend"]))
+        self.local_model:        str   = str(settings.get("local_model",         DEFAULT_SETTINGS["local_model"]))
+        self.paste_mode:         str   = str(settings.get("paste_mode",          DEFAULT_SETTINGS["paste_mode"]))
+        self.type_cps:           float = float(settings.get("type_cps",          DEFAULT_SETTINGS["type_cps"]))  # type: ignore
 
         self.enabled:      bool = True
         self.recording:    bool = False
@@ -785,6 +919,10 @@ class DiburitApp:
             "max_recordings_kept": self.max_recordings_kept,
             "speech_rate":         self.speech_rate,
             "show_status_rows":    self.show_status_rows,
+            "transcription_backend": self.transcription_backend,
+            "local_model":         self.local_model,
+            "paste_mode":          self.paste_mode,
+            "type_cps":            self.type_cps,
         })
 
     def _apply_max_recordings(self, n: int) -> None:
@@ -1075,7 +1213,7 @@ class DiburitApp:
 
     def _transcribe_worker(self, utterance: Utterance) -> None:
         try:
-            text = _transcribe_with_groq(utterance.audio_path)
+            text = transcribe(utterance.audio_path, self.transcription_backend, self.local_model)
         except Exception as exc:
             print(f"[Diburit] transcription failed: {exc}", file=sys.stderr)
             platform_compat.notify("Diburit", f"Transcription failed: {str(exc)[:120]}")
@@ -1095,7 +1233,7 @@ class DiburitApp:
             print(f"[Diburit] could not write transcript: {exc}", file=sys.stderr)
 
         platform_compat.copy_to_clipboard(text)
-        pasted, target_app = self._paste_into_frontmost()
+        pasted, target_app = self._deliver_into_frontmost(text)
         utterance.target_app = target_app
         if pasted:
             utterance.pasted_at = time.time()
@@ -1118,17 +1256,25 @@ class DiburitApp:
         self._enqueue_refresh(transcribing=False, last_transcript=text)
         _prune_recordings(self.max_recordings_kept)
 
-    def _paste_into_frontmost(self) -> Tuple[bool, str]:
+    def _deliver_into_frontmost(self, text: str) -> Tuple[bool, str]:
+        """Get the transcript into the frontmost app, either by instant paste
+        (default) or by typing it character-by-character when paste_mode is
+        'type'. The text is already on the clipboard, so type-mode still leaves
+        a working paste fallback if injection lands somewhere unexpected."""
         front = platform_compat.get_frontmost_app()
         if not front or front in _PASTE_BLOCKLIST:
             print(f"[Diburit] paste skipped (focus: {front!r})", file=sys.stderr)
             return False, front or ""
         try:
-            platform_compat.send_paste()
+            if self.paste_mode == PASTE_MODE_TYPE:
+                platform_compat.type_text(text, self.type_cps)
+                print(f"[Diburit] typed into {front!r} @ {self.type_cps:.0f} cps", flush=True)
+            else:
+                platform_compat.send_paste()
+                print(f"[Diburit] pasted into {front!r}", flush=True)
         except Exception as exc:
-            print(f"[Diburit] paste failed: {exc}", file=sys.stderr)
+            print(f"[Diburit] delivery failed: {exc}", file=sys.stderr)
             return False, front
-        print(f"[Diburit] pasted into {front!r}", flush=True)
         return True, front
 
 

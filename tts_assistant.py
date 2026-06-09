@@ -19,6 +19,7 @@ once we have spoken, so the next typed user message does not trigger TTS.
 
 from __future__ import annotations
 
+import difflib
 import json
 import os
 import re
@@ -32,7 +33,7 @@ from typing import Optional
 import requests
 from dotenv import load_dotenv
 
-__version__ = "1.3.1"
+__version__ = "1.4.0"
 
 
 DIBURIT_HOME = Path.home() / "Diburit"
@@ -140,6 +141,32 @@ def _normalize_ws(s: str) -> str:
     return re.sub(r"\s+", " ", s).strip()
 
 
+# How much of the dictated transcript must appear (in order, char-level) in
+# the sent user message to treat that message as this dictation. Below 1.0 so
+# small post-paste edits — a fixed typo, a word Whisper got slightly wrong
+# that you corrected — don't break the readback, while a message typed from
+# scratch still falls well short and won't trigger a false readback.
+TRANSCRIPT_MATCH_MIN_COVERAGE = 0.75
+
+
+def _transcript_matches(transcript: str, user_text: str) -> bool:
+    """True if `transcript` is approximately contained in `user_text`.
+
+    Exact (whitespace-normalized) substring is the fast path. Otherwise we
+    measure how much of the transcript is covered by in-order matching blocks
+    against the user message (difflib), which tolerates a few edited
+    characters/words without firing on an unrelated typed message."""
+    a = _normalize_ws(transcript)
+    b = _normalize_ws(user_text)
+    if not a or not b:
+        return False
+    if a in b:
+        return True
+    sm = difflib.SequenceMatcher(None, a, b, autojunk=False)
+    matched = sum(block.size for block in sm.get_matching_blocks())
+    return matched / len(a) >= TRANSCRIPT_MATCH_MIN_COVERAGE
+
+
 def _preview(s: str) -> str:
     if not s:
         return ""
@@ -167,17 +194,20 @@ def _resolve_latest_dir() -> Optional[Path]:
         if LATEST_DIR.exists():
             return LATEST_DIR
         return None
-    # Windows: try symlink first (works when Developer Mode is enabled),
-    # then fall back to latest.txt written by diburit_win.py.
-    if LATEST_DIR.exists():
-        return LATEST_DIR
+    # Windows: latest.txt (written by diburit_core._repoint_latest) is the
+    # reliable pointer. The `latest` symlink can freeze at an old recording
+    # when os.replace over the existing dir-symlink fails — so prefer
+    # latest.txt and only fall back to the symlink if it's absent.
     latest_txt = DIBURIT_HOME / "latest.txt"
     if latest_txt.exists():
         try:
             p = Path(latest_txt.read_text(encoding="utf-8").strip())
-            return p if p.is_dir() else None
+            if p.is_dir():
+                return p
         except OSError:
-            return None
+            pass
+    if LATEST_DIR.exists():
+        return LATEST_DIR
     return None
 
 
@@ -214,7 +244,7 @@ def read_and_consume_metadata(latest_user_text: Optional[str]) -> Optional[dict]
             not isinstance(transcript, str)
             or not transcript.strip()
             or not latest_user_text
-            or _normalize_ws(transcript) not in _normalize_ws(latest_user_text)
+            or not _transcript_matches(transcript, latest_user_text)
         ):
             return None
         data["consumed"] = True
@@ -446,10 +476,20 @@ def summarize_via_groq(text: str) -> str:
         return ""
 
 
-def _render_edge_tts(text: str, edge_voice: str, out_path: Path) -> bool:
-    """Render `text` with Microsoft Edge TTS into `out_path` (MP3).
-    Returns True iff the file was written and has non-zero size. Any
-    failure (missing package, network, voice not found) is logged and
+def _edge_rate_str(rate: float) -> str:
+    """speech-rate multiplier -> edge-tts percentage string (1.5 -> '+50%').
+    edge-tts re-times the speech at render time without shifting pitch, which
+    is how Windows readback gets real speed control (pygame can't re-time an
+    already-rendered MP3). Mirrors diburit_core.edge_rate_str; kept local so
+    this Stop-hook stays import-standalone from the app package."""
+    r = max(MIN_SPEECH_RATE, min(rate, MAX_SPEECH_RATE))
+    return f"{round((r - 1.0) * 100):+d}%"
+
+
+def _render_edge_tts(text: str, edge_voice: str, out_path: Path, rate: float = 1.0) -> bool:
+    """Render `text` with Microsoft Edge TTS into `out_path` (MP3) at the given
+    speed multiplier. Returns True iff the file was written and has non-zero
+    size. Any failure (missing package, network, voice not found) is logged and
     returns False so the caller can fall back to `say`."""
     try:
         import asyncio
@@ -459,7 +499,7 @@ def _render_edge_tts(text: str, edge_voice: str, out_path: Path) -> bool:
         return False
 
     async def _run() -> None:
-        communicate = edge_tts.Communicate(text, edge_voice)
+        communicate = edge_tts.Communicate(text, edge_voice, rate=_edge_rate_str(rate))
         await communicate.save(str(out_path))
 
     try:
@@ -518,21 +558,38 @@ def _afplay_nonblocking(path: Path, volume: float, rate: float = 1.0) -> None:
         except Exception as exc:
             print(f"[tts] afplay failed: {exc}", file=sys.stderr)
     else:
-        import threading  # noqa: PLC0415
-
-        def _play() -> None:
-            try:
-                import pygame  # type: ignore  # noqa: PLC0415
-                pygame.mixer.init()
-                pygame.mixer.music.load(str(path))
-                pygame.mixer.music.set_volume(vol)
-                pygame.mixer.music.play()
-                while pygame.mixer.music.get_busy():
-                    time.sleep(0.05)
-            except Exception as exc:
-                print(f"[tts] pygame play failed: {exc}", file=sys.stderr)
-
-        threading.Thread(target=_play, daemon=True).start()
+        # Windows: playback MUST outlive this process. A daemon thread (the
+        # obvious choice) dies the instant the Stop-hook's python process exits
+        # - which happens immediately after speak() returns - so the audio was
+        # cut off before it was ever audible. Spawn a child that owns the pygame
+        # playback and survives our exit: the Windows analogue of macOS's
+        # start_new_session afplay. Run it through pythonw.exe (the console-less
+        # interpreter) with CREATE_NO_WINDOW so no console window ever flashes
+        # on screen each time Diburit speaks.
+        CREATE_NO_WINDOW = 0x08000000
+        exe = Path(sys.executable)
+        pythonw = exe.with_name("pythonw.exe")
+        player_exe = str(pythonw) if pythonw.exists() else sys.executable
+        player = (
+            "import sys, time, pygame\n"
+            "pygame.mixer.init()\n"
+            "pygame.mixer.music.load(sys.argv[1])\n"
+            "pygame.mixer.music.set_volume(float(sys.argv[2]))\n"
+            "pygame.mixer.music.play()\n"
+            "while pygame.mixer.music.get_busy():\n"
+            "    time.sleep(0.05)\n"
+        )
+        try:
+            subprocess.Popen(
+                [player_exe, "-c", player, str(path), f"{vol:.2f}"],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=CREATE_NO_WINDOW,
+                close_fds=True,
+            )
+        except Exception as exc:
+            print(f"[tts] windows playback spawn failed: {exc}", file=sys.stderr)
 
 
 def _render_say(text: str, voice: str, env: dict) -> bool:
@@ -584,8 +641,11 @@ def speak(text: str) -> None:
 
     if voice.startswith(EDGE_PREFIX):
         edge_voice = voice[len(EDGE_PREFIX):]
-        if _render_edge_tts(text, edge_voice, SPEECH_MP3):
-            _afplay_nonblocking(SPEECH_MP3, volume, rate)
+        # edge-tts bakes the tempo into the MP3 at render time, so play it back
+        # at native speed (rate=1.0) - otherwise macOS's afplay -r would speed
+        # it a second time. This is what makes the rate slider work on Windows.
+        if _render_edge_tts(text, edge_voice, SPEECH_MP3, rate):
+            _afplay_nonblocking(SPEECH_MP3, volume, 1.0)
             return
         print(f"[tts] edge tts failed, falling back to {DEFAULT_VOICE}", file=sys.stderr)
         if _render_say(text, DEFAULT_VOICE, env):
@@ -633,6 +693,11 @@ def main() -> None:
         hook_input = {}
 
     session_id = hook_input.get("session_id")
+    # Fallback: the Windows hook wrapper passes session_id as argv[1] instead
+    # of stdin, because PowerShell piping to a native exe's stdin is
+    # unreliable (and a `cmd /c "..."` hook command doesn't fire at all).
+    if not session_id and len(sys.argv) > 1 and sys.argv[1].strip():
+        session_id = sys.argv[1].strip()
     if not session_id:
         return
 

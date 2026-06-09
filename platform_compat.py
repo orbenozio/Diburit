@@ -156,6 +156,141 @@ def send_paste() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Gradual typing (character-by-character injection)
+# ---------------------------------------------------------------------------
+
+# Bounds for the typing speed, in characters per second. 1000 cps is
+# effectively "instant"; the floor keeps a stray 0 from hanging forever.
+MIN_TYPE_CPS = 1.0
+MAX_TYPE_CPS = 1000.0
+
+
+def _win_type_text(text: str, cps: float) -> None:
+    """Type `text` into the foreground app one character at a time via
+    SendInput. Uses KEYEVENTF_UNICODE so each character is delivered by its
+    code point regardless of the active keyboard layout - the same reason
+    paste uses VK codes, and what makes Hebrew inject correctly under a Hebrew
+    or English layout. Newlines are sent as VK_RETURN (a literal '\\n' unicode
+    event does not produce an Enter in most apps)."""
+    import ctypes
+    from ctypes import wintypes
+
+    INPUT_KEYBOARD   = 1
+    KEYEVENTF_KEYUP  = 0x0002
+    KEYEVENTF_UNICODE = 0x0004
+    VK_RETURN        = 0x0D
+    VK_TAB           = 0x09
+
+    ULONG_PTR = ctypes.c_size_t
+
+    class KEYBDINPUT(ctypes.Structure):
+        _fields_ = [
+            ("wVk",         wintypes.WORD),
+            ("wScan",       wintypes.WORD),
+            ("dwFlags",     wintypes.DWORD),
+            ("time",        wintypes.DWORD),
+            ("dwExtraInfo", ULONG_PTR),
+        ]
+
+    class MOUSEINPUT(ctypes.Structure):
+        _fields_ = [
+            ("dx", wintypes.LONG), ("dy", wintypes.LONG),
+            ("mouseData", wintypes.DWORD), ("dwFlags", wintypes.DWORD),
+            ("time", wintypes.DWORD), ("dwExtraInfo", ULONG_PTR),
+        ]
+
+    class HARDWAREINPUT(ctypes.Structure):
+        _fields_ = [("uMsg", wintypes.DWORD), ("wParamL", wintypes.WORD), ("wParamH", wintypes.WORD)]
+
+    class _InputUnion(ctypes.Union):
+        _fields_ = [("ki", KEYBDINPUT), ("mi", MOUSEINPUT), ("hi", HARDWAREINPUT)]
+
+    class INPUT(ctypes.Structure):
+        _fields_ = [("type", wintypes.DWORD), ("u", _InputUnion)]
+
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    user32.SendInput.argtypes = (wintypes.UINT, ctypes.POINTER(INPUT), ctypes.c_int)
+    user32.SendInput.restype  = wintypes.UINT
+
+    def _send(*events: "INPUT") -> None:
+        arr = (INPUT * len(events))(*events)
+        user32.SendInput(len(events), arr, ctypes.sizeof(INPUT))
+
+    def _vk(vk: int) -> None:
+        down = INPUT(type=INPUT_KEYBOARD)
+        down.u.ki = KEYBDINPUT(wVk=vk, wScan=0, dwFlags=0, time=0, dwExtraInfo=0)
+        up = INPUT(type=INPUT_KEYBOARD)
+        up.u.ki = KEYBDINPUT(wVk=vk, wScan=0, dwFlags=KEYEVENTF_KEYUP, time=0, dwExtraInfo=0)
+        _send(down, up)
+
+    def _unicode(cp: int) -> None:
+        down = INPUT(type=INPUT_KEYBOARD)
+        down.u.ki = KEYBDINPUT(wVk=0, wScan=cp, dwFlags=KEYEVENTF_UNICODE, time=0, dwExtraInfo=0)
+        up = INPUT(type=INPUT_KEYBOARD)
+        up.u.ki = KEYBDINPUT(wVk=0, wScan=cp, dwFlags=KEYEVENTF_UNICODE | KEYEVENTF_KEYUP, time=0, dwExtraInfo=0)
+        _send(down, up)
+
+    delay = 1.0 / max(MIN_TYPE_CPS, min(cps, MAX_TYPE_CPS))
+    for ch in text:
+        if ch in ("\n", "\r"):
+            _vk(VK_RETURN)
+        elif ch == "\t":
+            _vk(VK_TAB)
+        else:
+            # Send each UTF-16 code unit (handles non-BMP via surrogate pair).
+            for unit in _utf16_units(ch):
+                _unicode(unit)
+        time.sleep(delay)
+
+
+def _utf16_units(ch: str) -> List[int]:
+    """UTF-16 code units for a single character (one int for BMP, a surrogate
+    pair for astral code points like emoji)."""
+    b = ch.encode("utf-16-le")
+    return [b[i] | (b[i + 1] << 8) for i in range(0, len(b), 2)]
+
+
+def type_text(text: str, cps: float) -> None:
+    """Inject `text` into the foreground app character-by-character at `cps`
+    characters per second (a human-typing effect), instead of an instant paste.
+    Blocking - callers run it on the background transcription thread. Waits the
+    focus-settle delay first, mirroring send_paste()."""
+    if not text:
+        return
+    time.sleep(FOCUS_SETTLE_SEC)
+    if sys.platform == "darwin":
+        _mac_type_text(text, cps)
+    else:
+        _win_type_text(text, cps)
+
+
+def _mac_type_text(text: str, cps: float) -> None:
+    """macOS character-by-character typing via Quartz Unicode key events."""
+    try:
+        from Quartz import (  # type: ignore
+            CGEventCreateKeyboardEvent,
+            CGEventKeyboardSetUnicodeString,
+            CGEventPost,
+            kCGHIDEventTap,
+        )
+    except Exception as exc:
+        print(f"[Diburit] mac type_text unavailable: {exc}", file=sys.stderr)
+        return
+    delay = 1.0 / max(MIN_TYPE_CPS, min(cps, MAX_TYPE_CPS))
+    for ch in text:
+        # pyobjc accepts the Python string directly and handles the UTF-16
+        # buffer; length is the number of UTF-16 units in the character.
+        n_units = len(ch.encode("utf-16-le")) // 2
+        down = CGEventCreateKeyboardEvent(None, 0, True)
+        CGEventKeyboardSetUnicodeString(down, n_units, ch)
+        CGEventPost(kCGHIDEventTap, down)
+        up = CGEventCreateKeyboardEvent(None, 0, False)
+        CGEventKeyboardSetUnicodeString(up, n_units, ch)
+        CGEventPost(kCGHIDEventTap, up)
+        time.sleep(delay)
+
+
+# ---------------------------------------------------------------------------
 # Frontmost / foreground application name
 # ---------------------------------------------------------------------------
 
